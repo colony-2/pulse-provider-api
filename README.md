@@ -46,7 +46,7 @@ launch := provider.Launch{
 ```
 
 `Base` selects an execution environment by concrete name or family alias, with
-optional prefix matching. It has no mandatory OCI syntax and no separate OS,
+optional wildcard matching. It has no mandatory OCI syntax and no separate OS,
 architecture, or version fields. Providers resolve it to a runner base, VM
 template, container image, or another environment satisfying the request.
 
@@ -56,6 +56,7 @@ For example, a concrete base named `ubuntu-24.04-arm64` could declare the aliase
 | Selector | Matches |
 | --- | --- |
 | `ubuntu-24.04-arm64` | That concrete base. |
+| `ubuntu-24*arm64` | Bases with names or aliases starting with `ubuntu-24` and ending with `arm64`. |
 | `ubuntu-24.04*` | Bases with names or declared aliases starting with `ubuntu-24.04`. |
 | `ubuntu*` | Bases with names or declared aliases starting with `ubuntu`. |
 | `linux*` | Bases with names or declared aliases starting with `linux`. |
@@ -65,9 +66,10 @@ Matching rules:
 
 - The selector must be nonempty. Without `*`, require a case-sensitive exact
   match against the concrete name or a declared alias.
-- A single trailing `*` means literal prefix matching, including an empty
-  suffix. Embedded or multiple `*` characters are invalid. No other glob, regex,
-  version-range, or implicit hierarchy semantics apply.
+- Each `*` anywhere matches zero or more characters, including `/`. Repeated
+  stars are allowed; `*` alone matches any base. All other characters are literal.
+  There are no character classes, escapes, regex, version ranges, or implicit
+  hierarchy semantics. Match the entire concrete name or alias.
 - Family aliases are explicitly declared, not inferred from the concrete name.
   `linux*` matches the example through its `linux` alias. An exact alias such as
   `linux` can also match multiple concrete bases.

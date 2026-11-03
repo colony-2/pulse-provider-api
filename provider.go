@@ -64,12 +64,12 @@ type Allocation struct {
 	ScratchBytes int64 `json:"scratch_bytes" yaml:"scratch_bytes"`
 	// Base is a nonempty execution-environment selector. Match case-sensitively
 	// against a concrete base name or an explicitly declared family alias.
-	// Without '*', require equality; a single trailing '*' matches a literal
-	// prefix (including an empty suffix). '*' alone matches any base. Other
-	// placements or multiple '*' characters are invalid. There are no other glob,
-	// regex, version-range, or implicit hierarchy semantics.
+	// Without '*', require equality. Each '*' anywhere in the selector matches
+	// zero or more characters, including '/'; repeated '*' characters are allowed.
+	// '*' alone matches any base. Every other character is literal: there are no
+	// character classes, escapes, regex, version-range, or hierarchy semantics.
 	// For example, ubuntu-24.04-arm64 can declare the family aliases ubuntu and
-	// linux, matching ubuntu-24.04*, ubuntu*, and linux*. Aliases must describe
+	// linux, matching ubuntu-24*arm64, ubuntu*, and linux*. Aliases must describe
 	// the execution environment and follow the host's/provider's agreed contract.
 	// Any matching base satisfying all other requirements is acceptable; no
 	// newest/best preference is implied. Preserve the selector across fallback,
