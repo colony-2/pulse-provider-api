@@ -1,8 +1,9 @@
-# Pulse provider API — proposal
+# Pulse provider API
 
 A small, standard-library-only Go contract for implementing Pulse c2j execution
-providers in independent repositories. This is a review draft; Pulse does not
-consume it yet.
+providers in independent repositories. Pulse and external providers consume this
+module. The required `GetCapabilities` method is a new breaking interface change;
+providers must adopt it before Pulse updates its dependency.
 
 ```go
 import (
@@ -12,14 +13,14 @@ import (
 
 // The entire required interface:
 type Provider interface {
+    GetCapabilities(context.Context) (provider.Capabilities, error)
     Submit(context.Context, []provider.Launch) ([]provider.Submission, error)
     List(context.Context, provider.ListRequest) (provider.ListResponse, error)
 }
 ```
 
 The module has one package (`provider`), one source file, and no external module
-dependencies. Its only imports are `context` and `time`. Go 1.22 is the proposed
-minimum. JSON/YAML struct tags are passive metadata and require no codec dependency.
+dependencies. Its only imports are `context` and `time`. Go 1.22 is the minimum. JSON/YAML struct tags are passive metadata and require no codec dependency.
 
 ## Allocation and assignment
 
@@ -45,48 +46,40 @@ launch := provider.Launch{
 }
 ```
 
-`Base` selects an execution environment by concrete name or family alias, with
-optional wildcard matching. It has no mandatory OCI syntax and no separate OS,
-architecture, or version fields. Providers resolve it to a runner base, VM
-template, container image, or another environment satisfying the request.
-
-For example, a concrete base named `ubuntu-24.04-arm64` could declare the aliases
-`ubuntu` and `linux`:
+`Base` selects an execution environment by concrete name with optional `*`
+wildcards. It has no mandatory OCI syntax and no separate OS, architecture, or
+version fields. Providers resolve it to a runner base, VM template, container
+image, or another environment satisfying the request. There are no aliases.
 
 | Selector | Matches |
 | --- | --- |
 | `ubuntu-24.04-arm64` | That concrete base. |
-| `ubuntu-24*arm64` | Bases with names or aliases starting with `ubuntu-24` and ending with `arm64`. |
-| `ubuntu-24.04*` | Bases with names or declared aliases starting with `ubuntu-24.04`. |
-| `ubuntu*` | Bases with names or declared aliases starting with `ubuntu`. |
-| `linux*` | Bases with names or declared aliases starting with `linux`. |
+| `ubuntu-24*arm64` | Names starting with `ubuntu-24` and ending with `arm64`. |
+| `ubuntu-24.04*` | Names starting with `ubuntu-24.04`. |
+| `ubuntu*` | Names starting with `ubuntu`. |
+| `linux*` | Names starting with `linux`; never an Ubuntu label. |
 | `*` | Any base satisfying the other requirements. |
 
 Matching rules:
 
-- The selector must be nonempty. Without `*`, require a case-sensitive exact
-  match against the concrete name or a declared alias.
+- Selectors and concrete names must be nonempty valid UTF-8, at most 4096 bytes,
+  without NUL, spaces, tabs, CR, or LF. Concrete names cannot contain `*`.
+- Without `*`, require a case-sensitive exact match against the concrete name.
 - Each `*` anywhere matches zero or more characters, including `/`. Repeated
-  stars are allowed; `*` alone matches any base. All other characters are literal.
-  There are no character classes, escapes, regex, version ranges, or implicit
-  hierarchy semantics. Match the entire concrete name or alias.
-- Family aliases are explicitly declared, not inferred from the concrete name.
-  `linux*` matches the example through its `linux` alias. An exact alias such as
-  `linux` can also match multiple concrete bases.
-- Names and aliases have agreed meanings across providers. For example, `linux`
-  describes the job's execution environment, not merely the provider's host.
-  A base label promises only the environment defined by its contract; tool and
-  service requirements should be explicit capabilities where appropriate.
-- Any match satisfying resource, capability, and deadline requirements is valid;
-  there is no implied newest/best ordering. Broad selectors may resolve to
-  different releases, architectures, or tool sets across attempts or providers.
+  stars are allowed. All other characters are literal: no character classes,
+  escapes, regex, version ranges, or implicit hierarchy semantics.
+- Names have agreed meanings across providers and describe the job's execution
+  environment. A base promises only the environment defined by its contract;
+  tool and service requirements should be explicit capabilities where appropriate.
+- Any match satisfying all constraints is valid. `GetCapabilities` lists bases
+  in provider preference order; the selector itself implies no newest/best order.
 
 Preserve the requested selector across fallback. Before executing, resolve a
-concrete environment and report its actual identity/platform and guaranteed
-allocation to c2j; do not advertise a wildcard selector as an allocation fact.
-The alias catalog, validation, matching, and resolution implementations remain
-outside this library. Existing OS/architecture/variant constraints must be mapped
-to selectors that preserve them or declined, never silently broadened.
+concrete environment and report that label and guaranteed allocation to c2j
+(using `--execution-base` or `C2J_EXECUTION_BASE`); never advertise the selector
+as an allocation fact. Catalogs, validation, matching, and resolution remain
+outside this library. Existing constraints must be preserved or declined, never
+silently broadened.
 
 `Capabilities` is an open vocabulary represented as `[]string`. Matching is exact
 and all-of, with set semantics: no ordering, wildcards, or implied capabilities.
@@ -134,37 +127,98 @@ contains `JobRef` and `LaunchID` for correlation, and no lease field.
   cancellation, and keep accepted workload lifetime independent of call context.
   Runtime limits must continue to hold after the submitting host exits.
 
-## Scope and integration after review
+## Capability discovery
+
+`GetCapabilities` is required on every provider. The initial response describes
+bases and their optional execution capability names. Keeping it as a structured
+response allows later additions without introducing more discovery methods.
+
+```go
+func (p *Provider) GetCapabilities(ctx context.Context) (provider.Capabilities, error) {
+    if err := ctx.Err(); err != nil {
+        return provider.Capabilities{}, err
+    }
+    return provider.Capabilities{
+        BasesComplete: true,
+        Bases: []provider.BaseCapabilities{
+            {
+                Name: "macos-sequoia-15.7.7-arm64",
+                Capabilities: []string{"nix", "git", "node", "pnpm", "uv", "python"},
+            },
+        },
+    }, nil
+}
+```
+
+Advertise configured support, including busy or warming bases. Discovery must not
+start VMs, prepare templates, reconcile work, or reserve capacity. Return data
+that callers can read safely while other calls run. Do not include credentials,
+endpoints with credentials, or arbitrary configuration. On error, the caller
+discards the response and treats discovery as failed, not as proof of no support.
+
+`Bases` is ordered, most preferred first, with unique concrete names. A Docker
+implementation should list bases for the **daemon's native Linux architecture**
+before emulated alternatives: ARM64 on Apple Silicon or ARM Linux; AMD64 on AMD64
+Linux. An explicit selector always wins: never choose ARM64 for an AMD64-only
+request. Ordering bases within a provider is separate from host policy for
+choosing between Docker, Tart, and other providers.
+
+Each listed base supplies a complete capability-name set. Empty means that no
+optional capabilities can be supplied for that base. A provider unable to describe
+a base's capability set leaves that base unlisted and marks the catalog partial.
+
+| Response | Meaning for placement |
+| --- | --- |
+| Complete catalog, no matching base | Provider is incompatible with this base request. |
+| Complete catalog, every matching base lacks a requested capability | Provider is incompatible with this capability request. |
+| Partial catalog, no suitable listed base | Support is unknown; the provider may support an unlisted base. |
+| Suitable listed base | Candidate only; resource, deadline, availability, and combined constraints still need admission. |
+| Empty complete catalog | No supported bases, regardless of current utilization. |
+| Zero-value response | Unknown support; safe fallback for implementations without discovery. |
+
+`BasesComplete` is deliberately explicit. Dynamic container image references
+cannot usually be enumerated. Such a provider can advertise its finite named
+catalog with `BasesComplete: false`, while keeping dynamic requests eligible for
+`Submit`. A complete finite VM catalog can set it to `true`. No caller may infer
+incompatibility solely from absence in a partial catalog. For an exact listed
+base, an absent capability name proves that particular base is incompatible.
+
+These are support hints, not allocation facts or reservations. Do not remove a
+base merely because its slots are occupied. A cached response can become stale;
+`Submit` must always revalidate and return its normal outcome. Refresh frequency,
+caching, validation, filtering, and matching stay in hosts/implementations.
+Resource bounds and deadline support are outside this first discovery response.
+
+## Adoption and placement follow-up
+
+1. External providers, including Tart/Orchard, add the required method and report
+   their configured bases and verified capability offerings. This module alone
+   does not upgrade their guest c2j binaries or lease handling.
+2. After those libraries adopt the interface, Pulse can update its dependencies
+   and expose the same discovery data in startup diagnostics.
+3. Pulse can then skip provably incompatible providers before submission, using
+   the current leased request. Discovery must not replace lease-time validation,
+   provider admission, or existing rules forbidding fallback after uncertainty.
+4. Default local placement should try Docker before Tart (different priority
+   tiers), and Docker should prefer native architecture for broad selectors.
+   Explicit provider priorities and explicit base requests remain authoritative.
+   A default such as `ubuntu-26*arm64` pins ARM64; native-first defaults on AMD64
+   require an architecture-neutral selector or a deliberate new default policy.
+
+The last two policies are **not implemented by this module**. At review time,
+Pulse assigns automatic Docker and Tart equal priority and rotates within the
+priority tier; its native base catalog tries ARM64 first on every host. Pulse
+integration should correct both rather than relying on provider map order or
+alphabetically sorted platform names.
+
+## Scope
 
 No dependency on Pulse core, c2j, JobDB, cloud SDKs, OCI parsers, YAML libraries,
 gRPC, or the plugin framework. No factory, global registry, config schema,
-capability negotiation, lifecycle interface, transport, validation helpers,
-ID generation, or pagination implementation. Each implementation can expose its
-own typed constructor and cleanup; the host owns wiring and lifetime.
-
-A host imports a provider library, constructs it, and supplies it to Pulse after
-integration. Providers must be linked into that host binary. This draft does not
-add dynamic loading to the stock Pulse executable.
-
-Integration will need to:
-
-1. Adopt these shared boundary types and adapt Pulse's allocation/assignment
-   construction. Keep validation, base matching/resolution, and alias catalogs in
-   core or implementations. Existing validation methods cannot be attached to aliases
-   of external types; use core helper functions or explicit internal adapters.
-2. Add host wiring for externally constructed `provider.Provider` instances,
-   including implementation-specific configuration and cleanup.
-3. Move c2j invocation and secure lease delivery into providers or shared adapter
-   code outside this module. Pass the resolved environment and verified execution
-   allocation facts to c2j rather than the requested selector.
-4. Adapt built-in providers and existing transports, including typed job
-   correlation, base resolution, and platform conversion. Existing remote/plugin
-   contracts need explicit mapping or versioning; this is not a compatible rename.
-
-The initial draft was based on Pulse commit
-`1a8c516450289290316302be7fb08908e505f0ad` (`pkg/compute/compute.go` and `list.go`).
-This proposal now deliberately changes that contract. No Pulse core edits are
-part of this draft.
+lifecycle interface, transport, validation helpers, ID generation, or pagination
+implementation. Implementations expose their own typed constructor and cleanup;
+the host owns wiring and lifetime. Providers must be linked into that host binary;
+this module does not add dynamic loading.
 
 ## Local checks
 
