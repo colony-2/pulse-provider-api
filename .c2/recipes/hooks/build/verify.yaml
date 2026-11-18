@@ -1,0 +1,48 @@
+schema_version: 2
+id: provider-plugin-verify
+version: 0.1.0
+inputs:
+  api_version: ${{ inputs.api_version }}
+  base: ${{ inputs.base }}
+  candidate: ${{ inputs.candidate }}
+  target_directory: ${{ inputs.target_directory }}
+  documents: ${{ inputs.documents }}
+  request: ${{ inputs.request }}
+  settings: ${{ inputs.settings }}
+input_schema:
+  api_version:
+    type: string
+    default_value: c2.build-hook/v1
+  base:
+    type: string
+    default_value: ""
+  candidate:
+    type: string
+    default_value: ""
+  target_directory:
+    type: string
+    default_value: .
+  documents:
+    type: artifact_map
+    default_value: {}
+  request:
+    type: string
+    default_value: ""
+  settings:
+    type: object
+    default_value: {}
+outputs:
+  api_version: c2.build-hook/v1
+  status: '${{ sequence.checks.outputs.exit_code == 0 ? "passed" : "failed" }}'
+  summary: '${{ sequence.checks.outputs.exit_code == 0 ? "Root and plugin tests, vet, race, consumers, tidiness and reproducible generation passed." : "Required provider/plugin acceptance failed; inspect error/plugin-checks.log." }}'
+  artifact_refs:
+    error/plugin-checks.log: ${{ sequence.checks.artifacts['error/plugin-checks.log'] }}
+sequence:
+  - id: checks
+    op: command_execution
+    inputs:
+      env:
+        OUTBOX: ${{ context.environment.op.outbox }}
+      run: |
+        mkdir -p "$OUTBOX/error"
+        make check > "$OUTBOX/error/plugin-checks.log" 2>&1

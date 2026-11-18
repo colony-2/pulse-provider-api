@@ -229,3 +229,15 @@ GOWORK=off GOPROXY=off go list -m all
 ```
 
 The final command should list only this module.
+
+## Optional process hosting
+
+The independently versioned nested module
+[`github.com/colony-2/pulse-provider-api/plugin`](plugin/README.md) provides `Serve`,
+`Start`, a ready `provider.Provider` process handle, correlated submission
+observations and configurable process supervision. It imports no Pulse code.
+Importing only this root API retains Go 1.22 and standard-library-only dependencies;
+transport dependencies belong to the nested module. The root provider interface
+is unchanged. Use `make check` to explicitly verify both modules, since root Go
+commands do not recurse into a nested module. SDK releases use `plugin/`-prefixed
+tags and require independent published resolution before being reported released.

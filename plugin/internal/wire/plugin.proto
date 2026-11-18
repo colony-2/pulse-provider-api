@@ -1,0 +1,31 @@
+syntax = "proto3";
+package pulse.provider.plugin.v2;
+option go_package = "github.com/colony-2/pulse-provider-api/plugin/internal/wire";
+import "google/protobuf/timestamp.proto";
+service Provider {
+ rpc Negotiate(Negotiation) returns (Negotiated);
+ rpc Initialize(Initialization) returns (Initialized);
+ rpc Control(ControlRequest) returns (Empty);
+ rpc GetCapabilities(Empty) returns (CapabilitiesResponse);
+ rpc Submit(SubmitRequest) returns (SubmitResponse);
+ rpc List(ListRequest) returns (ListResponse);
+}
+message Empty {}
+message Negotiation { uint32 protocol = 1; repeated string required = 2; int64 max_message_bytes = 3; int64 shutdown_nanos = 4; }
+message Negotiated { bytes implementation = 1; bytes version = 2; int64 max_message_bytes = 3; }
+message Env { bytes key = 1; bytes value = 2; }
+message Initialization { bytes name = 1; bytes config_yaml = 2; bytes base_dir = 3; repeated Env executor_env = 4; }
+message Initialized { MethodError error = 1; }
+message ControlRequest { bool shutdown = 1; }
+message MethodError { bytes text = 1; string class = 2; }
+message JobRef { bytes jobdb = 1; bytes instance_id = 2; bytes tenant_id = 3; bytes job_id = 4; }
+message Allocation { int64 cpu_millis = 1; int64 memory_bytes = 2; int64 scratch_bytes = 3; bytes base = 4; repeated bytes capabilities = 5; }
+message Launch { bytes launch_id = 1; Allocation allocation = 2; JobRef job = 3; bytes lease = 4; int64 timeout_seconds = 5; google.protobuf.Timestamp start_before = 6; }
+message Submission { bytes launch_id = 1; bytes status = 2; bytes reason = 3; }
+message SubmitRequest { uint64 invocation = 1; repeated Launch launches = 2; }
+message SubmitResponse { repeated Submission results = 1; MethodError error = 2; }
+message BaseCapabilities { bytes name = 1; repeated bytes capabilities = 2; }
+message CapabilitiesResponse { repeated BaseCapabilities bases = 1; bool bases_complete = 2; MethodError error = 3; }
+message ListRequest { int32 page_size = 1; bytes page_token = 2; bytes launch_id = 3; }
+message Instance { bytes id = 1; bytes launch_id = 2; bytes state = 3; JobRef job = 4; repeated bytes refs = 5; google.protobuf.Timestamp created_at = 6; google.protobuf.Timestamp started_at = 7; }
+message ListResponse { repeated Instance items = 1; bytes next_page_token = 2; MethodError error = 3; }

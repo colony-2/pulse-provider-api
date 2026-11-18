@@ -1,0 +1,3 @@
+packages:
+  - nix:nixpkgs#go
+  - nix:nixpkgs#protobuf

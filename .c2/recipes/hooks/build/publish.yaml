@@ -1,0 +1,58 @@
+schema_version: 2
+id: provider-plugin-release
+version: 0.1.0
+inputs:
+  api_version: ${{ inputs.api_version }}
+  base: ${{ inputs.base }}
+  candidate: ${{ inputs.candidate }}
+  target_directory: ${{ inputs.target_directory }}
+  documents: ${{ inputs.documents }}
+  request: ${{ inputs.request }}
+  settings: ${{ inputs.settings }}
+  merged_hash: ${{ inputs.merged_hash }}
+  target_branch: ${{ inputs.target_branch }}
+input_schema:
+  api_version:
+    type: string
+    default_value: c2.build-hook/v1
+  base:
+    type: string
+    default_value: ""
+  candidate:
+    type: string
+    default_value: ""
+  target_directory:
+    type: string
+    default_value: .
+  documents:
+    type: artifact_map
+    default_value: {}
+  request:
+    type: string
+    default_value: ""
+  settings:
+    type: object
+    default_value: {}
+  merged_hash:
+    type: string
+    required: true
+  target_branch:
+    type: string
+    required: true
+outputs:
+  api_version: c2.build-hook/v1
+  status: '${{ sequence.release.outputs.exit_code == 0 ? "passed" : "failed" }}'
+  summary: '${{ sequence.release.outputs.exit_code == 0 ? "Plugin tag published; independent no-replacement author and host resolved and ran. See error/plugin-release.log for the published version and API pin." : "Plugin release acceptance failed; inspect error/plugin-release.log. No Pulse adoption is required." }}'
+  artifact_refs:
+    error/plugin-release.log: ${{ sequence.release.artifacts['error/plugin-release.log'] }}
+sequence:
+  - id: release
+    op: command_execution
+    inputs:
+      env:
+        OUTBOX: ${{ context.environment.op.outbox }}
+        MERGED_HASH: ${{ inputs.merged_hash }}
+        TARGET_BRANCH: ${{ inputs.target_branch }}
+      run: |
+        mkdir -p "$OUTBOX/error"
+        plugin/scripts/publish.sh "$MERGED_HASH" "$TARGET_BRANCH" > "$OUTBOX/error/plugin-release.log" 2>&1
