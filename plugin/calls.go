@@ -2,6 +2,8 @@ package plugin
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 
 	api "github.com/colony-2/pulse-provider-api"
 	"github.com/colony-2/pulse-provider-api/plugin/internal/wire"
@@ -11,7 +13,19 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func (p *Process) acquire(ctx context.Context) (*generation, context.Context, func(), error) {
+// sessionCaller holds the transport-independent call safeguards. A Process may
+// replace its current generation; a Connection permanently owns just one.
+type sessionCaller struct {
+	opts     StartOptions
+	mu       sync.Mutex
+	current  *generation
+	ctx      context.Context
+	cancel   context.CancelFunc
+	permits  chan struct{}
+	sequence atomic.Uint64
+}
+
+func (p *sessionCaller) acquire(ctx context.Context) (*generation, context.Context, func(), error) {
 	if e := ctx.Err(); e != nil {
 		return nil, nil, nil, e
 	}
@@ -32,7 +46,7 @@ func (p *Process) acquire(ctx context.Context) (*generation, context.Context, fu
 	stop := context.AfterFunc(g.ctx, cc)
 	return g, c, func() { stop(); cc(); <-p.permits }, nil
 }
-func (p *Process) beforeDispatch(ctx context.Context, g *generation, m proto.Message) error {
+func (p *sessionCaller) beforeDispatch(ctx context.Context, g *generation, m proto.Message) error {
 	if e := ctx.Err(); e != nil {
 		return e
 	}
@@ -49,7 +63,7 @@ func (p *Process) beforeDispatch(ctx context.Context, g *generation, m proto.Mes
 func callOptions(g *generation) []grpc.CallOption {
 	return []grpc.CallOption{grpc.MaxCallRecvMsgSize(g.limit), grpc.MaxCallSendMsgSize(g.limit), grpc.WaitForReady(false)}
 }
-func (p *Process) GetCapabilities(ctx context.Context) (api.Capabilities, error) {
+func (p *sessionCaller) GetCapabilities(ctx context.Context) (api.Capabilities, error) {
 	g, c, release, e := p.acquire(ctx)
 	if e != nil {
 		return api.Capabilities{}, e
@@ -65,7 +79,7 @@ func (p *Process) GetCapabilities(ctx context.Context) (api.Capabilities, error)
 	}
 	return fromCaps(r), fromError(r.Error)
 }
-func (p *Process) List(ctx context.Context, q api.ListRequest) (api.ListResponse, error) {
+func (p *sessionCaller) List(ctx context.Context, q api.ListRequest) (api.ListResponse, error) {
 	if e := validateList(&q); e != nil {
 		return api.ListResponse{}, e
 	}
@@ -88,11 +102,11 @@ func (p *Process) List(ctx context.Context, q api.ListRequest) (api.ListResponse
 	}
 	return v, fromError(r.Error)
 }
-func (p *Process) Submit(ctx context.Context, ls []api.Launch) ([]api.Submission, error) {
+func (p *sessionCaller) Submit(ctx context.Context, ls []api.Launch) ([]api.Submission, error) {
 	r, _, e := p.SubmitDetailed(ctx, ls)
 	return r, e
 }
-func (p *Process) SubmitDetailed(ctx context.Context, ls []api.Launch) ([]api.Submission, SubmissionObservations, error) {
+func (p *sessionCaller) SubmitDetailed(ctx context.Context, ls []api.Launch) ([]api.Submission, SubmissionObservations, error) {
 	id := p.sequence.Add(1)
 	o := SubmissionObservations{Invocation: id, Capture: "not_captured"}
 	if e := validateLaunches(ls); e != nil {

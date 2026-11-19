@@ -24,4 +24,4 @@ else
  git push origin "$merged:refs/tags/$tag"
 fi
 plugin/scripts/check-release.sh "$version"
-printf 'Published %s; independent no-replacement author/host verification passed.\n' "$tag"
+printf 'Published %s; independent no-replacement author/host verification passed, including reverse collector joins and departures.\n' "$tag"

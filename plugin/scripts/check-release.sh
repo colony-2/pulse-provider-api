@@ -10,6 +10,11 @@ trap 'rm -rf "$consumer_dir"' EXIT
 mkdir "$consumer_dir/author" "$consumer_dir/host" "$consumer_dir/cache"
 cp "$sdk_root/examples/provider/main.go" "$consumer_dir/author/main.go"
 cp "$sdk_root/examples/host/main.go" "$consumer_dir/host/main.go"
+mkdir "$consumer_dir/reverse-host" "$consumer_dir/reverse-provider"
+cp "$sdk_root/examples/reverse-host/main.go" "$consumer_dir/reverse-host/main.go"
+cp "$sdk_root/examples/reverse-provider/main.go" "$consumer_dir/reverse-provider/main.go"
+cp "$sdk_root/scripts/reverse-consumer.go" "$consumer_dir/reverse-consumer.go"
+
 cd "$consumer_dir"
 export GOWORK=off
 export GOMODCACHE="$consumer_dir/cache"
@@ -22,3 +27,7 @@ go list -m -json github.com/colony-2/pulse-provider-api/plugin github.com/colony
 go build -o author-bin ./author
 go build -o host-bin ./host
 ./host-bin "$consumer_dir/author-bin"
+
+go build -o reverse-host-bin ./reverse-host
+go build -o reverse-provider-bin ./reverse-provider
+go run reverse-consumer.go "$consumer_dir/reverse-host-bin" "$consumer_dir/reverse-provider-bin"

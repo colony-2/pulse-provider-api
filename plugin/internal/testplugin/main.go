@@ -4,8 +4,11 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -42,12 +45,20 @@ func waitFile(ctx context.Context, path string) {
 	}
 }
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "callback-hang" {
+		callbackHang()
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "native" {
 		native()
 		return
 	}
 	if len(os.Args) > 1 && os.Args[1] == "host" {
 		host()
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "reverse-host" {
+		reverseHost()
 		return
 	}
 	if os.Getenv("MODE") == "v1" {
@@ -59,7 +70,7 @@ func main() {
 		time.Sleep(time.Minute)
 		return
 	}
-	e := plugin.Serve(func(ctx context.Context, in plugin.Init) (api.Provider, plugin.Cleanup, error) {
+	factory := func(ctx context.Context, in plugin.Init) (api.Provider, plugin.Cleanup, error) {
 		dir := os.Getenv("EVENT_DIR")
 		mode := os.Getenv("MODE")
 		appendEvent(dir, "factory "+mode)
@@ -88,10 +99,59 @@ func main() {
 			return nil, cleanup, errors.New("sentinel private initialization")
 		}
 		return &fixture{dir: dir, mode: mode}, cleanup, nil
-	}, plugin.ServeOptions{Implementation: "fixture", Version: "1.0.0", FactoryTimeout: factoryTimeout(), ShutdownTimeout: 300 * time.Millisecond, MaxMessageBytes: serverLimit()})
+	}
+	opts := plugin.ServeOptions{Implementation: "fixture", Version: "1.0.0", FactoryTimeout: factoryTimeout(), ShutdownTimeout: 300 * time.Millisecond, MaxMessageBytes: serverLimit()}
+	var e error
+	if len(os.Args) > 1 && os.Args[1] == "reverse" {
+		dir := os.Getenv("EVENT_DIR")
+		e = plugin.Run(context.Background(), factory, plugin.RunOptions{Address: os.Args[2], TLSConfig: fixtureTLS(os.Args[3], false), Init: plugin.Initialization{Name: "fixture", BaseDir: dir, ConfigYAML: []byte("mode: fixture\n"), ExecutorEnv: map[string]string{"EXECUTOR_ONLY": "executor-default"}}, Serve: opts, StartupTimeout: time.Second})
+	} else {
+		e = plugin.Serve(factory, opts)
+	}
 	if e != nil {
 		os.Exit(1)
 	}
+}
+
+// Deliberately uncooperative callbacks live only in this disposable process.
+func callbackHang() {
+	l, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		panic(e)
+	}
+	c, e := plugin.StartCollector(context.Background(), l, plugin.CollectorOptions{TLSConfig: fixtureTLS(os.Args[2], true), Authorize: func(context.Context, tls.ConnectionState) (string, error) { return "fixture", nil }, MaxSubscriptions: 2, CallbackTimeout: 40 * time.Millisecond, ShutdownTimeout: 60 * time.Millisecond})
+	if e != nil {
+		panic(e)
+	}
+	entered := make(chan struct{}, 2)
+	fn := func(context.Context, plugin.ProviderChange) { entered <- struct{}{}; select {} }
+	a, e := c.OnProvidersChanged(context.Background(), fn)
+	if e != nil {
+		panic(e)
+	}
+	<-entered
+	a.Cancel()
+	if a.Wait() != context.Canceled {
+		panic("cancel")
+	}
+	b, e := c.OnProvidersChanged(context.Background(), fn)
+	if e != nil {
+		panic(e)
+	}
+	<-entered
+	if e = b.Wait(); !errors.Is(e, plugin.ErrCallback) || !errors.Is(e, context.DeadlineExceeded) {
+		panic("deadline")
+	}
+	for i := 0; i < 20; i++ {
+		if s, e := c.OnProvidersChanged(context.Background(), fn); s != nil || e != plugin.ErrSaturated {
+			panic("worker bound")
+		}
+	}
+	start := time.Now()
+	if e = c.Close(); e != nil || time.Since(start) > 300*time.Millisecond {
+		panic("shutdown")
+	}
+	fmt.Println("callback worker bound and shutdown verified")
 }
 func serverLimit() int { v, _ := strconv.Atoi(os.Getenv("SERVER_LIMIT")); return v }
 func factoryTimeout() time.Duration {
@@ -239,4 +299,61 @@ func hostMode() string {
 		return os.Args[3]
 	}
 	return "native"
+}
+
+func fixtureTLS(dir string, host bool) *tls.Config {
+	name := "fixture"
+	if host {
+		name = "collector.test"
+	}
+	pair, e := tls.LoadX509KeyPair(filepath.Join(dir, name+".crt"), filepath.Join(dir, name+".key"))
+	if e != nil {
+		panic(e)
+	}
+	b, e := os.ReadFile(filepath.Join(dir, "ca.crt"))
+	if e != nil {
+		panic(e)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(b) {
+		panic("CA")
+	}
+	c := &tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{plugin.ReverseALPN}, Certificates: []tls.Certificate{pair}, RootCAs: pool, ServerName: "collector.test"}
+	if host {
+		c.ClientCAs = pool
+		c.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	return c
+}
+func reverseHost() {
+	dir := os.Args[2]
+	trustDir := os.Args[3]
+	listener, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		os.Exit(2)
+	}
+	collector, e := plugin.StartCollector(context.Background(), listener, plugin.CollectorOptions{TLSConfig: fixtureTLS(trustDir, true), Authorize: func(_ context.Context, s tls.ConnectionState) (string, error) {
+		if s.PeerCertificates[0].VerifyHostname("fixture") != nil {
+			return "", plugin.ErrInvalid
+		}
+		return "fixture", nil
+	}, ProbeInterval: 30 * time.Millisecond, ProbeTimeout: 100 * time.Millisecond, ShutdownTimeout: 500 * time.Millisecond})
+	if e != nil {
+		os.Exit(2)
+	}
+	defer collector.Close()
+	_ = os.WriteFile(filepath.Join(dir, "host-address"), []byte(listener.Addr().String()), 0600)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	snapshot, e := collector.WaitForChange(ctx, 1)
+	if e != nil || len(snapshot.Providers) != 1 {
+		os.Exit(3)
+	}
+	deadline := time.Date(9999, 1, 1, 0, 0, 0, 123, time.UTC)
+	_, e = snapshot.Providers[0].Provider.Submit(ctx, []api.Launch{{LaunchID: "host-loss", Allocation: api.Allocation{Base: "ubuntu[ab]*/arm*", CPUMillis: api.MaxQuantity}, Lease: api.Lease("\xffexact-lease"), Job: api.JobRef{JobDB: "https://db/tenant", InstanceID: "db", TenantID: "tenant", JobID: "job"}, TimeoutSeconds: 2, StartBefore: &deadline}})
+	if e != nil {
+		os.Exit(4)
+	}
+	_ = os.WriteFile(filepath.Join(dir, "host-ready"), []byte("ready"), 0600)
+	select {}
 }

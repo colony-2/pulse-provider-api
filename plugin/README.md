@@ -92,6 +92,226 @@ replacement. Close cancels timers and calls, bounds cleanup and reaps the SDK
 process within one shutdown budget. Concurrent/repeated Close calls share one
 completion and error. Forced termination or failed cleanup returns `ErrCleanup`.
 
+## Outbound providers and the central collector
+
+A provider behind NAT can dial a central server instead of exposing a public
+endpoint. The central server starts one `Collector`, then reads a fresh snapshot
+for each invocation. It supplies the returned ordinary `provider.Provider`
+handles to its own placement logic. Local `Start`/`Serve` remains available.
+
+```go
+collector, err := plugin.StartCollector(serverContext, listener, plugin.CollectorOptions{
+    TLSConfig: hostTLS,
+    Authorize: authorizeProvider,
+})
+if err != nil { return err } // The caller still owns listener on failure.
+defer collector.Close()
+
+// Inject this interface into invocation handling; do not cache startup membership.
+var providers plugin.ProviderCollector = collector
+snapshot, err := providers.Snapshot()
+if err != nil { return err }
+// place(ctx, snapshot.Providers, launches) is your existing placement policy.
+```
+
+`StartCollector` returns promptly with zero providers and takes ownership of the
+listener only on success. Its context bounds the entire collector lifetime.
+`Wait()` reports fatal collection failure; an application supervisor must observe
+it. An empty running collector returns an empty successful snapshot. A stopped
+or failed collector returns `ErrUnavailable` and wakes change waiters.
+
+Snapshots contain copied, ID-sorted entries with `ID`, `Generation`, and
+`Provider`, plus a membership revision beginning at one. They perform no RPCs or
+reservations. Each join/departure advances the revision. Optional
+`WaitForChange(ctx, revision)` returns current membership immediately if already
+newer, otherwise waits independently of other observers. Future revisions are
+invalid, cancellation releases the waiter slot, and excess waits return
+`ErrSaturated`. Slow observers see the newest snapshot, without an event backlog.
+
+For ordered individual transitions, `*Collector` additionally implements the
+optional `ProviderChangeSource` interface. `ProviderCollector` itself still has
+only `Snapshot` and `WaitForChange`, so existing implementations need no new method.
+
+```go
+subscription, err := collector.OnProvidersChanged(observerContext,
+    func(ctx context.Context, change plugin.ProviderChange) {
+        for _, p := range change.Joined {
+            fmt.Printf("joined=%s/%d revision=%d\n", p.ID, p.Generation, change.Revision)
+        }
+        for _, p := range change.Left {
+            fmt.Printf("left=%s/%d revision=%d\n", p.ID, p.Generation, change.Revision)
+        }
+    })
+if err != nil { return err }
+defer subscription.Cancel()
+// A supervisor monitors subscription.Wait() independently of collector.Wait().
+// Continue obtaining a fresh Snapshot() for each invocation.
+```
+
+Registration atomically queues an `initial` event at the current revision, with
+all ready providers sorted by ID in `Joined` and an empty `Left`. Even an empty
+baseline is delivered; registration does not advance membership or wake snapshot
+waiters. Later `membership` events contain exact joins or departures in revision
+order, including providers that leave before their join callback executes.
+`ProviderChange` contains `Kind`, `Revision`, `Reason`, `Joined`, and `Left`.
+Typed constants expose the three kinds (`initial`, `membership`, `stopped`) and
+fixed reasons (`initial`, `ready`, `connection_lost`, `probe_failed`,
+`administrative_close`, `collector_closed`, `collector_failed`). Events contain no
+provider error text, leases or configuration, and do no capability RPCs. The first
+ready removal fixes its reason; these are SDK observations, not network diagnoses.
+
+Each subscriber owns its payload slices. Handles remain session-bound and may
+already be unavailable at delivery. Apply departures by both ID and generation;
+callbacks are observations, not capacity reservations. Failed admission or
+initialization emits no join. Healthy subscribers receive every delta once,
+serially; different subscribers have independent workers. User code runs outside
+collector locks and can read snapshots or cancel its subscription.
+
+| Callback option | Zero-value default | Nonzero bound |
+| --- | --- | --- |
+| `MaxSubscriptions` | 32 | 1–1024 |
+| `CallbackQueue` | 64 waiting events per subscriber | 1–4096 |
+| `CallbackTimeout` | 5 seconds per dispatch | Positive duration |
+
+Use keyed `CollectorOptions` literals: adding these optional fields changes the
+positional struct layout. Subscription limits are independent of snapshot waiters.
+The initial event counts against the queue until dispatched; one in-flight event
+is additional. The callback context carries observer values and a deadline starting
+at dispatch, shortened by an earlier observer or shared shutdown deadline.
+
+`Cancel()` is nonblocking and idempotent. It clears pending events and cancels an
+in-flight callback; already dispatched code may still start or continue. Observer
+context cancellation affects only that subscription. `Wait()` is concurrent-safe
+and reports one stable first terminal outcome:
+
+| Outcome | `Wait()` result |
+| --- | --- |
+| Explicit cancel / observer cancellation | `context.Canceled` / observer context error |
+| Queue overflow | `ErrSaturated` |
+| Callback panic | `ErrCallback`, without panic text |
+| Callback or shutdown delivery timeout | Matches both `ErrCallback` and `context.DeadlineExceeded` |
+| Failed collector or transport cleanup | `ErrUnavailable`, unless already terminated |
+| Final callback returned and orderly transport cleanup succeeded | nil |
+
+Delivery failure never fails the collector. It ends that subscription rather than
+silently dropping or coalescing events. Explicit re-registration starts a new
+baseline; it cannot replay history lost during the gap. A callback that ignores
+cancellation keeps its worker slot until it actually returns, bounding abandoned
+goroutines across repeated registrations. The SDK cannot forcibly stop user code.
+Keep callbacks short and cancellation-aware; do not call their own `Wait`, or
+blocking collector shutdown, from inside them.
+
+Shutdown immediately retires handles, then queues a newer `stopped` event after
+pending deltas, with sorted remaining providers in `Left` even when empty. Callback
+draining and transport disposal share one deadline and run concurrently. Overflow
+or an expired budget means final delivery is not promised. Revision exhaustion
+fails subscriptions without wrapping. To observe final delivery, keep the observer
+context live through explicit `collector.Close()` and `subscription.Wait()`, then
+cancel it. Canceling a shared collector/observer context instead detaches the
+observer with its context error.
+
+Each handle is a `*Connection`, permanently bound to one generation. It supports
+`SubmitDetailed`, `Health`, and administrative `Close` as well as ordinary provider
+calls. Invocation callers must not close their candidates. A departure invalidates
+retained handles; reconnect creates a fresh handle. Duplicate identities are
+rejected while reserved, including during initialization, without replacing their
+owner. Snapshots describe observed connectivity, never capacity or guaranteed
+reachability. Probes use only the control RPC and bypass business-call permits.
+
+Provider entry points reuse `Factory`, `Init`, strict config helpers, and the
+existing wire adapters:
+
+```go
+err := plugin.Run(providerContext, factory, plugin.RunOptions{
+    Address: "central.example:8443",
+    TLSConfig: clientTLS,
+    Init: plugin.Initialization{
+        Name: "worker-alpha", BaseDir: "/etc/my-provider",
+        ConfigYAML: localConfig,
+    },
+    Serve: plugin.ServeOptions{Implementation: "my-provider", Version: "1.0"},
+})
+```
+
+`Run` opens no listening port. It serves gRPC on its outbound TLS socket; the
+collector adopts that accepted socket as its gRPC client exactly once. The
+existing baseline-2 messages and generated bindings are unchanged. HashiCorp
+[go-plugin v1.6.2](https://github.com/hashicorp/go-plugin/tree/v1.6.2) explicitly
+excludes real-network plugins; this additive transport uses gRPC's socket
+adapters and the SDK's shared call safety instead of adding a tunnel library.
+
+The protocol layers, on exactly one connection, are:
+
+1. The provider is the TCP and TLS client; the collector accepts that connection.
+2. Mutual TLS 1.3 verifies both peers. ALPN must be
+   `pulse-provider-reverse/1`, not ordinary `h2` or `http/1.1`.
+3. Inside TLS, the collector writes `PPR1`, one status byte, a two-byte big-endian
+   identity length, and the authorized UTF-8 identity (at most 256 bytes).
+   Status 0 admits; 1 denies authorization or stopped collection; 2 means duplicate
+   reserved identity; 3 means provider capacity; 4 means generation exhaustion.
+   Rejections have zero identity length. These are fixed admission codes, not
+   provider method errors; incompatible SDK semantics fail subsequent `Negotiate`.
+4. The collector adopts that socket as the HTTP/2/gRPC client and sends the client
+   preface; the provider serves the existing unary protobuf service on its dialed
+   socket. `Negotiate` and successful `Initialize` precede ready publication.
+
+HTTP/2 is required after admission; there is no HTTP/1 fallback, ordinary HTTPS
+endpoint, second tunnel connection, or standard gRPC TLS/ALPN handshake at that
+point. The gRPC adapter uses the already encrypted socket, not plaintext network
+transport. Use direct TCP or TCP passthrough; an ordinary HTTP proxy or HTTPS
+ingress cannot transparently carry this custom protocol. Callbacks are local
+notifications and add no wire messages, services, or tunnel dependencies.
+
+Both TLS configurations must require TLS 1.3 and exactly
+`NextProtos: []string{plugin.ReverseALPN}`. The host requires
+`RequireAndVerifyClientCert`, explicit `ClientCAs`, and a certificate. The provider
+requires explicit `RootCAs`, a verified `ServerName`, and a client certificate.
+Skip verification, weakened settings, and `GetConfigForClient` overrides are
+rejected. Certificate/key callbacks remain caller-owned and must be safe for
+concurrent use. Options copy initialization and trust pools. Authorization maps
+verified certificates to configured IDs of 1–256 UTF-8 bytes without control
+characters; do not authorize an unverified claimed name. The host must scope
+credentials to the intended tenant/environment. Renewal affects new sessions;
+close existing handles and reject reauthorization to revoke them.
+
+Initialization belongs to the provider machine: the host supplies only its
+authorized identity. Host config, paths, executor-default overrides, and identity
+mismatches are rejected before construction. Every new session constructs a fresh
+provider. The provider must apply or reject its local executor defaults.
+
+Collector defaults retain the local SDK's startup, business call, shutdown,
+message, concurrency, and probe bounds. Additional finite defaults are 128
+providers, 32 pending connections/authorization callbacks, 1024 change waiters,
+and 16 KiB incoming HTTP/2 metadata (provider side also 16 KiB). The provider
+serves at most business concurrency plus two control streams. Excess admissions
+do not displace ready providers. TLS and authorization share the startup bound;
+a callback ignoring cancellation keeps its work slot until it returns.
+
+`Run` reconnects only when explicitly enabled through `Reconnect RestartPolicy`.
+It reuses bounded delay, multiplier, jitter, and healthy-reset conventions, with
+no replacement until the old session's cleanup succeeds. Certificate, identity,
+admission, negotiation, and initialization rejection are terminal. Reconnecting
+never queues, resends, or resolves a previous submission. A received shutdown
+returns nil unless cleanup failed; context cancellation returns its context error.
+
+Collector shutdown retires handles immediately and disposes peers concurrently
+under one shutdown budget. Run cancels maintenance and bounds cleanup; accepted
+native work remains detached and enforces its own runtime cap. An uncooperative
+factory or failed cleanup ends Run with `ErrCleanup` and prevents reconnect.
+Late cleanup registration runs once without publishing readiness. The SDK cannot
+kill caller-owned goroutines or remote processes; use external supervision when
+forced termination is needed. These network checks run on Linux; additional
+platform certification and production Pulse listener/handler wiring are separate.
+
+The independent commands in `examples/reverse-host` and
+`examples/reverse-provider` load certificates and provider YAML from explicit
+files. The host handles repeated `invoke` lines on stdin. The standard-library
+`scripts/reverse-consumer.go` helper generates temporary trust and exercises both
+commands, including joins and departures, without Pulse or a provider listener.
+The host registers one callback subscription, distinguishes event output from
+invocation results, and supervises delivery failure. The consumer checks its
+initial baseline, ordered generation-aware deltas, and final stopped event.
+
 ## API results and submission uncertainty
 
 The wire preserves all root API fields, byte-exact leases/cursors (including
@@ -144,15 +364,17 @@ hosting race checks, checks nested tidiness and reproduces generated bindings.
 `make generate` requires protoc 36.2 and uses pinned protoc-gen-go v1.35.2 and
 protoc-gen-go-grpc v1.5.1 in a temporary directory. It fails if generated content
 changes. Consumer tests compile the published root API with Go 1.22.12 and build/run
-copied author/host commands in an isolated module with a temporary candidate
-replacement. No replacement is committed to either module.
+copied local and reverse author/host commands in an isolated module with a temporary
+candidate replacement. The reverse pair exercises invocation snapshots and callbacks
+as alpha and beta join and leave. No replacement is committed to either module.
 
 Release this directory through the repository publication route with a
 `plugin/vX.Y.Z` tag; the nested module's version is `vX.Y.Z`. A root-only tag does
 not version this module. After publication, run `make release-check VERSION=vX.Y.Z`.
 That check downloads the exact SDK version into a fresh module cache with no
 replacements, reports the resolved API pin and SDK version, and builds/runs the
-independent author and host. A successful local replacement check does not prove
+independent local and reverse example pairs, including collector membership changes.
+A successful local replacement check does not prove
 published availability. Publication and this check do not depend on Pulse adoption.
 
 The repository's build verify hook runs `make check`. After the managed recipe

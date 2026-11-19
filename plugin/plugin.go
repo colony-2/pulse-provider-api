@@ -35,6 +35,7 @@ var (
 	ErrProtocol    = errors.New("plugin: incompatible protocol or execution semantics")
 	ErrTooLarge    = errors.New("plugin: message limit exceeded")
 	ErrCleanup     = errors.New("plugin: cleanup failed or exceeded shutdown bound")
+	ErrCallback    = errors.New("plugin: callback failed or exceeded delivery bound")
 )
 
 // Initialization is copied across the process boundary. ExecutorEnv supplies
@@ -179,7 +180,10 @@ func (o *StartOptions) defaults() error {
 			return ErrInvalid
 		}
 	}
-	r := &o.Restart
+	return o.Restart.defaults()
+}
+
+func (r *RestartPolicy) defaults() error {
 	if r.MaxAttempts < 0 || r.InitialDelay < 0 || r.MaxDelay < 0 || r.HealthyResetInterval < 0 || math.IsNaN(r.Multiplier) || math.IsInf(r.Multiplier, 0) || math.IsNaN(r.JitterFraction) || r.JitterFraction < 0 || r.JitterFraction > 1 {
 		return ErrInvalid
 	}

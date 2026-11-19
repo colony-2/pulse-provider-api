@@ -42,7 +42,7 @@ input_schema:
 outputs:
   api_version: c2.build-hook/v1
   status: '${{ sequence.release.outputs.exit_code == 0 ? "passed" : "failed" }}'
-  summary: '${{ sequence.release.outputs.exit_code == 0 ? "Plugin tag published; independent no-replacement author and host resolved and ran. See error/plugin-release.log for the published version and API pin." : "Plugin release acceptance failed; inspect error/plugin-release.log. No Pulse adoption is required." }}'
+  summary: '${{ sequence.release.outputs.exit_code == 0 ? "Plugin tag published; independent no-replacement local and reverse examples resolved and ran, including collector joins and departures. See error/plugin-release.log for the published version and API pin." : "Plugin release acceptance failed; inspect error/plugin-release.log. No Pulse adoption is required." }}'
   artifact_refs:
     error/plugin-release.log: ${{ sequence.release.artifacts['error/plugin-release.log'] }}
 sequence:

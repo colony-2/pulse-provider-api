@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	api "github.com/colony-2/pulse-provider-api"
@@ -26,15 +25,9 @@ import (
 // Process is a ready provider handle. Calls never queue for another generation.
 // Close releases hosting resources without terminating detached native work.
 type Process struct {
-	opts          StartOptions
-	mu            sync.Mutex
+	sessionCaller
 	health        Health
-	current       *generation
-	ctx           context.Context
-	cancel        context.CancelFunc
 	done          chan struct{}
-	permits       chan struct{}
-	sequence      atomic.Uint64
 	closeOnce     sync.Once
 	closeDeadline time.Time
 	closeErr      error
@@ -81,7 +74,7 @@ func Start(ctx context.Context, options StartOptions) (*Process, error) {
 		}
 		options.SHA256 = hex.EncodeToString(b)
 	}
-	p := &Process{opts: options, done: make(chan struct{}), permits: make(chan struct{}, options.Concurrency), health: Health{Name: options.Init.Name, Protocol: Protocol, State: "starting"}}
+	p := &Process{sessionCaller: sessionCaller{opts: options, permits: make(chan struct{}, options.Concurrency)}, done: make(chan struct{}), health: Health{Name: options.Init.Name, Protocol: Protocol, State: "starting"}}
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 	ready := make(chan error, 1)
 	go p.supervise(ctx, ready)

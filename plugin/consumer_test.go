@@ -40,7 +40,7 @@ require (
 		t.Fatal(e)
 	}
 	command(t, dir, []string{"GOTOOLCHAIN=go1.22.12"}, "go", "mod", "edit", "-replace=github.com/colony-2/pulse-provider-api/plugin="+root)
-	for _, name := range []string{"provider", "host"} {
+	for _, name := range []string{"provider", "host", "reverse-host", "reverse-provider"} {
 		source, e := os.ReadFile(filepath.Join("examples", name, "main.go"))
 		if e != nil {
 			t.Fatal(e)
@@ -55,8 +55,25 @@ require (
 	}
 	command(t, dir, []string{"GOTOOLCHAIN=go1.22.12"}, "go", "mod", "tidy")
 	command(t, dir, []string{"GOTOOLCHAIN=go1.22.12"}, "go", "build", "-o", filepath.Join(dir, "provider-bin"), "./provider")
+	command(t, dir, []string{"GOTOOLCHAIN=go1.22.12"}, "go", "build", "-o", filepath.Join(dir, "reverse-host-bin"), "./reverse-host")
+	command(t, dir, []string{"GOTOOLCHAIN=go1.22.12"}, "go", "build", "-o", filepath.Join(dir, "reverse-provider-bin"), "./reverse-provider")
+	helper, e := os.ReadFile(filepath.Join("scripts", "reverse-consumer.go"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = os.WriteFile(filepath.Join(dir, "reverse-consumer.go"), helper, 0600); e != nil {
+		t.Fatal(e)
+	}
+	output := command(t, dir, []string{"GOTOOLCHAIN=go1.22.12"}, "go", "run", "reverse-consumer.go", filepath.Join(dir, "reverse-host-bin"), filepath.Join(dir, "reverse-provider-bin"))
+	if !strings.Contains(output, "independent reverse collector join/leave verification passed") {
+		t.Fatal(output)
+	}
+	if !strings.Contains(output, "independent callback baseline, ordered deltas and stopped delivery passed") {
+		t.Fatal(output)
+	}
+	t.Log(output)
 	command(t, dir, []string{"GOTOOLCHAIN=go1.22.12"}, "go", "build", "-o", filepath.Join(dir, "host-bin"), "./host")
-	output := command(t, dir, []string{"GOTOOLCHAIN=go1.22.12"}, filepath.Join(dir, "host-bin"), filepath.Join(dir, "provider-bin"))
+	output = command(t, dir, []string{"GOTOOLCHAIN=go1.22.12"}, filepath.Join(dir, "host-bin"), filepath.Join(dir, "provider-bin"))
 	if !strings.Contains(output, "ready protocol=2 bases=1") {
 		t.Fatal(output)
 	}

@@ -241,3 +241,11 @@ transport dependencies belong to the nested module. The root provider interface
 is unchanged. Use `make check` to explicitly verify both modules, since root Go
 commands do not recurse into a nested module. SDK releases use `plugin/`-prefixed
 tags and require independent published resolution before being reported released.
+
+The optional plugin SDK also supports outbound network providers through
+`Run` and a central `StartCollector`. Hosts read a fresh `ProviderCollector`
+snapshot per invocation as providers join and leave. Providers need no publicly
+addressable endpoint. Optional `OnProvidersChanged` subscriptions deliver an initial
+baseline and ordered join/leave details with bounded queues and explicit delivery
+failure. They complement the fresh invocation snapshots. See the [SDK's outbound connection guide](plugin/README.md#outbound-providers-and-the-central-collector)
+for mutual TLS, authorization, local configuration, and session safety.

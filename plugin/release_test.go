@@ -179,3 +179,59 @@ func TestReleaseScriptRejectsUnsupportedBranchRefs(t *testing.T) {
 		f.assertNoRelease()
 	}
 }
+
+// Exercise the actual release-check sequence with fake Go commands. The failure
+// originates specifically in the reverse consumer, after both local builds run.
+func TestReleaseCheckRejectsReverseConsumerFailure(t *testing.T) {
+	dir := t.TempDir()
+	sdk := filepath.Join(dir, "plugin")
+	for _, name := range []string{"scripts", "examples/provider", "examples/host", "examples/reverse-host", "examples/reverse-provider"} {
+		if e := os.MkdirAll(filepath.Join(sdk, name), 0700); e != nil {
+			t.Fatal(e)
+		}
+	}
+	for _, name := range []string{"scripts/check-release.sh", "scripts/reverse-consumer.go", "examples/provider/main.go", "examples/host/main.go", "examples/reverse-host/main.go", "examples/reverse-provider/main.go"} {
+		b, e := os.ReadFile(name)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if e = os.WriteFile(filepath.Join(sdk, name), b, 0700); e != nil {
+			t.Fatal(e)
+		}
+	}
+	fakeGo := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$RELEASE_COMMANDS"
+case "$1" in
+ get) exit 0;;
+ mod) exit 0;;
+ list) exit 0;;
+ build) printf '#!/bin/sh\nexit 0\n' > "$3"; chmod +x "$3"; exit 0;;
+ run) echo 'reverse consumer failed' >&2; exit 19;;
+esac
+exit 20
+`
+	bin := filepath.Join(dir, "bin")
+	if e := os.Mkdir(bin, 0700); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.WriteFile(filepath.Join(bin, "go"), []byte(fakeGo), 0700); e != nil {
+		t.Fatal(e)
+	}
+	commands := filepath.Join(dir, "commands")
+	cmd := exec.Command("sh", filepath.Join(sdk, "scripts/check-release.sh"), "v0.2.0")
+	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "RELEASE_COMMANDS="+commands)
+	out, e := cmd.CombinedOutput()
+	if e == nil || !strings.Contains(string(out), "reverse consumer failed") {
+		t.Fatal(e, string(out))
+	}
+	log, e := os.ReadFile(commands)
+	if e != nil {
+		t.Fatal(e)
+	}
+	for _, expected := range []string{"build -o author-bin ./author", "build -o host-bin ./host", "build -o reverse-host-bin ./reverse-host", "build -o reverse-provider-bin ./reverse-provider", "run reverse-consumer.go"} {
+		if !strings.Contains(string(log), expected) {
+			t.Fatal("missing release step", expected, string(log))
+		}
+	}
+}

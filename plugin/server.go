@@ -22,23 +22,31 @@ import (
 
 type server struct {
 	wire.UnimplementedProviderServer
-	opts        ServeOptions
-	factory     Factory
-	mu          sync.Mutex
-	negotiated  bool
-	initialized bool
-	closing     bool
-	max         int
-	shutdown    time.Duration
-	provider    api.Provider
-	cleanup     Cleanup
-	lifetime    context.Context
-	cancel      context.CancelFunc
-	cleanupOnce sync.Once
-	cleanupErr  error
-	permits     chan struct{}
-	high        uint64
-	tokens      map[uint64]struct{}
+	opts             ServeOptions
+	factory          Factory
+	mu               sync.Mutex
+	negotiated       bool
+	initialized      bool
+	closing          bool
+	max              int
+	shutdown         time.Duration
+	provider         api.Provider
+	cleanup          Cleanup
+	lifetime         context.Context
+	cancel           context.CancelFunc
+	cleanupOnce      sync.Once
+	cleanupErr       error
+	shutdownDeadline time.Time
+	permits          chan struct{}
+	high             uint64
+	tokens           map[uint64]struct{}
+	// reverseInit is provider-local; hosts may supply only its bound identity.
+	reverseInit      *Initialization
+	terminal         chan error
+	ready            chan struct{}
+	factoryDone      chan struct{}
+	shutdownReceived chan struct{}
+	shutdownOnce     sync.Once
 }
 
 // Serve blocks until shutdown. Call it once from a dedicated provider command;
@@ -106,11 +114,12 @@ func (s *server) close() error {
 		s.mu.Lock()
 		s.closing = true
 		cb := s.cleanup
-		budget := s.shutdown
+		deadline := time.Now().Add(s.shutdown)
+		s.shutdownDeadline = deadline
 		s.mu.Unlock()
 		s.cancel()
 		if cb != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), budget)
+			ctx, cancel := context.WithDeadline(context.Background(), deadline)
 			defer cancel()
 			done := make(chan error, 1)
 			go func() { done <- cb(ctx) }()
@@ -139,7 +148,20 @@ func (s *server) intercept(ctx context.Context, req any, info *grpc.UnaryServerI
 		return nil, status.Error(codes.ResourceExhausted, "message bound")
 	}
 	if info.FullMethod == wire.Provider_Negotiate_FullMethodName || info.FullMethod == wire.Provider_Initialize_FullMethodName || info.FullMethod == wire.Provider_Control_FullMethodName {
-		return s.boundedResponse(ctx, req, next, limit)
+		r, e := s.boundedResponse(ctx, req, next, limit)
+		if s.terminal != nil && info.FullMethod != wire.Provider_Control_FullMethodName {
+			failed := e != nil
+			if v, ok := r.(*wire.Initialized); ok && v.Error != nil {
+				failed = true
+			}
+			if failed {
+				select {
+				case s.terminal <- ErrProtocol:
+				default:
+				}
+			}
+		}
+		return r, e
 	}
 	select {
 	case s.permits <- struct{}{}:
@@ -195,12 +217,19 @@ func (s *server) Initialize(ctx context.Context, n *wire.Initialization) (*wire.
 	}
 	s.initialized = true
 	s.mu.Unlock()
-	if len(n.ConfigYaml) > MaxConfigBytes || len(n.Name) == 0 || !filepath.IsAbs(string(n.BaseDir)) {
+	if s.reverseInit == nil && (len(n.ConfigYaml) > MaxConfigBytes || len(n.Name) == 0 || !filepath.IsAbs(string(n.BaseDir))) {
 		return &wire.Initialized{Error: toError(ErrInvalid)}, nil
 	}
 	input := Initialization{Name: string(n.Name), ConfigYAML: append([]byte(nil), n.ConfigYaml...), BaseDir: string(n.BaseDir), ExecutorEnv: map[string]string{}}
 	for _, e := range n.ExecutorEnv {
 		input.ExecutorEnv[string(e.GetKey())] = string(e.GetValue())
+	}
+	if s.reverseInit != nil {
+		defer close(s.factoryDone)
+		if string(n.Name) != s.reverseInit.Name || len(n.ConfigYaml) != 0 || len(n.BaseDir) != 0 || len(n.ExecutorEnv) != 0 {
+			return &wire.Initialized{Error: toError(ErrInvalid)}, nil
+		}
+		input = copyInitialization(*s.reverseInit)
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.opts.FactoryTimeout)
 	defer cancel()
@@ -208,14 +237,21 @@ func (s *server) Initialize(ctx context.Context, n *wire.Initialization) (*wire.
 	// Register even if the factory returned an error. No callback can be
 	// registered for a factory that never returns before process termination.
 	s.mu.Lock()
-	s.cleanup = cleanup
 	closing := s.closing
+	if !closing {
+		s.cleanup = cleanup
+	}
 	s.mu.Unlock()
 	if closing {
 		if cleanup != nil {
 			c, cc := context.WithTimeout(context.Background(), s.shutdown)
 			defer cc()
-			go cleanup(c)
+			done := make(chan error, 1)
+			go func() { done <- cleanup(c) }()
+			select {
+			case <-done:
+			case <-c.Done():
+			}
 		}
 		return &wire.Initialized{Error: toError(ErrUnavailable)}, nil
 	}
@@ -230,15 +266,24 @@ func (s *server) Initialize(ctx context.Context, n *wire.Initialization) (*wire.
 		return &wire.Initialized{Error: toError(ErrUnavailable)}, nil
 	}
 	s.mu.Lock()
-	if !s.closing {
-		s.provider = p
+	if s.closing {
+		s.mu.Unlock()
+		return &wire.Initialized{Error: toError(ErrUnavailable)}, nil
 	}
+	s.provider = p
 	s.mu.Unlock()
+	if s.ready != nil {
+		close(s.ready)
+	}
 	return &wire.Initialized{}, nil
 }
 func (s *server) Control(ctx context.Context, n *wire.ControlRequest) (*wire.Empty, error) {
 	if n.Shutdown {
-		if e := s.close(); e != nil {
+		e := s.close()
+		if s.shutdownReceived != nil {
+			s.shutdownOnce.Do(func() { close(s.shutdownReceived) })
+		}
+		if e != nil {
 			return nil, status.Error(codes.DeadlineExceeded, "cleanup")
 		}
 	}

@@ -1,6 +1,6 @@
 schema_version: 2
 id: provider-plugin-verify
-version: 0.1.0
+version: 0.3.0
 inputs:
   api_version: ${{ inputs.api_version }}
   base: ${{ inputs.base }}
@@ -34,7 +34,7 @@ input_schema:
 outputs:
   api_version: c2.build-hook/v1
   status: '${{ sequence.checks.outputs.exit_code == 0 ? "passed" : "failed" }}'
-  summary: '${{ sequence.checks.outputs.exit_code == 0 ? "Root and plugin tests, vet, race, consumers, tidiness and reproducible generation passed." : "Required provider/plugin acceptance failed; inspect error/plugin-checks.log." }}'
+  summary: '${{ sequence.checks.outputs.exit_code == 0 ? "Root and plugin tests, ordered collector callbacks and worker bounds, reverse network acceptance, vet, race, independent consumers, tidiness and reproducible generation passed." : "Required provider/plugin acceptance failed; inspect error/plugin-checks.log." }}'
   artifact_refs:
     error/plugin-checks.log: ${{ sequence.checks.artifacts['error/plugin-checks.log'] }}
 sequence:
@@ -44,5 +44,15 @@ sequence:
       env:
         OUTBOX: ${{ context.environment.op.outbox }}
       run: |
+        set -eu
         mkdir -p "$OUTBOX/error"
-        make check > "$OUTBOX/error/plugin-checks.log" 2>&1
+        {
+          git rev-parse HEAD
+          git status --short
+          verify_index=$(mktemp)
+          rm -f "$verify_index"
+          GIT_INDEX_FILE="$verify_index" git add -A
+          GIT_INDEX_FILE="$verify_index" git write-tree
+          rm -f "$verify_index"
+          make check
+        } > "$OUTBOX/error/plugin-checks.log" 2>&1
