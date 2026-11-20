@@ -72,6 +72,16 @@ require (
 	if !strings.Contains(output, "independent callback baseline, ordered deltas and stopped delivery passed") {
 		t.Fatal(output)
 	}
+
+	for _, transport := range []string{"tls", "http"} {
+		for _, source := range []string{"env", "stdin"} {
+			for _, id := range []string{"alpha", "beta"} {
+				if !strings.Contains(output, "independent mutual-key "+transport+" "+source+" "+id+" passed") {
+					t.Fatal("missing required key scenario", transport, source, id, output)
+				}
+			}
+		}
+	}
 	t.Log(output)
 	command(t, dir, []string{"GOTOOLCHAIN=go1.22.12"}, "go", "build", "-o", filepath.Join(dir, "host-bin"), "./host")
 	output = command(t, dir, []string{"GOTOOLCHAIN=go1.22.12"}, filepath.Join(dir, "host-bin"), filepath.Join(dir, "provider-bin"))

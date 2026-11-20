@@ -22,12 +22,12 @@ func logFile(t *testing.T, dir, name string) {
 		t.Fatal(e)
 	}
 }
-func logTransport(t *testing.T, reverse bool, mode string, configure func(*LogOptions)) (api.Provider, string) {
+func logTransport(t *testing.T, transport, mode string, configure func(*LogOptions)) (api.Provider, string) {
 	t.Helper()
 	var p api.Provider
 	var dir string
-	if reverse {
-		tr := testTrust(t, "fixture")
+	if transport != "process" {
+		tr := modeTrust(t, transport, "fixture")
 		o := collectorOptions(tr)
 		o.CallTimeout = 250 * time.Millisecond
 		o.MaxMessageBytes = 1024
@@ -36,7 +36,7 @@ func logTransport(t *testing.T, reverse bool, mode string, configure func(*LogOp
 		}
 		c := testCollector(t, o)
 		dir = t.TempDir()
-		reverseProcess(t, c.listener.Addr().String(), tr.files(t), dir, mode)
+		reverseProcess(t, c.listener.Addr().String(), tr.files(t), dir, mode, transport)
 		p = nextSnapshot(t, c, 1).Providers[0].Provider
 	} else {
 		o := options(t, mode)
@@ -50,23 +50,34 @@ func logTransport(t *testing.T, reverse bool, mode string, configure func(*LogOp
 	}
 	t.Cleanup(func() {
 		logFile(t, dir, "log-exit")
-		files, _ := filepath.Glob(filepath.Join(dir, "log-pid-*"))
-		for _, f := range files {
-			pid := readPID(t, dir, filepath.Base(f))
+		if mode == "logs-error" {
+			return // Rejected launches have no native child.
+		}
+		// A completed submission can precede the child's first scheduled write.
+		// Discover children from parent-side submission events, then wait for each
+		// PID marker so a late child cannot recreate files during TempDir cleanup.
+		seen := map[string]bool{}
+		for _, event := range strings.Split(events(dir), "\n") {
+			id, ok := strings.CutPrefix(event, "submit ")
+			if !ok || seen[id] {
+				continue
+			}
+			seen[id] = true
+			pid := readPID(t, dir, "log-pid-"+id)
 			eventually(t, func() bool { reapAdopted(pid); return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) })
 		}
 	})
 	return p, dir
 }
 func TestLogTransportsSourcesForeverAndSmallEnvelopes(t *testing.T) {
-	for _, reverse := range []bool{false, true} {
+	for _, transport := range []string{"process", "mtls", "key-tls", "key-http"} {
 		for _, combined := range []bool{false, true} {
-			t.Run(fmt.Sprintf("reverse=%v/combined=%v", reverse, combined), func(t *testing.T) {
+			t.Run(fmt.Sprintf("%s/combined=%v", transport, combined), func(t *testing.T) {
 				mode := "logs"
 				if combined {
 					mode = "logs-combined"
 				}
-				p, dir := logTransport(t, reverse, mode, nil)
+				p, dir := logTransport(t, transport, mode, nil)
 				var mu sync.Mutex
 				output := map[string][]byte{}
 				records := 0
@@ -146,9 +157,9 @@ func TestLogTransportsSourcesForeverAndSmallEnvelopes(t *testing.T) {
 	}
 }
 func TestLogTransportsStopDuringAdmission(t *testing.T) {
-	for _, reverse := range []bool{false, true} {
-		t.Run(fmt.Sprint(reverse), func(t *testing.T) {
-			p, dir := logTransport(t, reverse, "logs-hold", nil)
+	for _, transport := range []string{"process", "mtls", "key-tls", "key-http"} {
+		t.Run(transport, func(t *testing.T) {
+			p, dir := logTransport(t, transport, "logs-hold", nil)
 			logs, cancelLogs := context.WithCancel(context.Background())
 			defer cancelLogs()
 			entered := make(chan struct{}, 1)
@@ -199,9 +210,9 @@ func TestLogTransportsStopDuringAdmission(t *testing.T) {
 	}
 }
 func TestLogTransportsDurationAndNoListener(t *testing.T) {
-	for _, reverse := range []bool{false, true} {
-		t.Run(fmt.Sprint(reverse), func(t *testing.T) {
-			p, dir := logTransport(t, reverse, "logs-hold", nil)
+	for _, transport := range []string{"process", "mtls", "key-tls", "key-http"} {
+		t.Run(transport, func(t *testing.T) {
+			p, dir := logTransport(t, transport, "logs-hold", nil)
 			noListener, _, e := p.Submit(context.Background(), []api.Launch{}, api.SubmitOptions{})
 			if e == nil || len(noListener) != 0 {
 				t.Fatal("invalid batch accepted")
@@ -225,9 +236,9 @@ func TestLogTransportsDurationAndNoListener(t *testing.T) {
 }
 
 func TestLogTransportsStuckCallbacksKeepBusinessUsable(t *testing.T) {
-	for _, reverse := range []bool{false, true} {
-		t.Run(fmt.Sprint(reverse), func(t *testing.T) {
-			p, dir := logTransport(t, reverse, "logs", func(o *LogOptions) { o.MaxSubscriptions = 1; o.CallbackTimeout = 30 * time.Millisecond })
+	for _, transport := range []string{"process", "mtls", "key-tls", "key-http"} {
+		t.Run(transport, func(t *testing.T) {
+			p, dir := logTransport(t, transport, "logs", func(o *LogOptions) { o.MaxSubscriptions = 1; o.CallbackTimeout = 30 * time.Millisecond })
 			entered := make(chan struct{})
 			release := make(chan struct{})
 			defer close(release)
@@ -255,9 +266,9 @@ func TestLogTransportsStuckCallbacksKeepBusinessUsable(t *testing.T) {
 	}
 }
 func TestLogTransportsLossDuringAdmissionDoesNotReplay(t *testing.T) {
-	for _, reverse := range []bool{false, true} {
-		t.Run(fmt.Sprint(reverse), func(t *testing.T) {
-			p, dir := logTransport(t, reverse, "logs-hold", nil)
+	for _, transport := range []string{"process", "mtls", "key-tls", "key-http"} {
+		t.Run(transport, func(t *testing.T) {
+			p, dir := logTransport(t, transport, "logs-hold", nil)
 			entered := make(chan struct{}, 1)
 			done := make(chan struct{})
 			var ss []api.Submission
@@ -277,6 +288,16 @@ func TestLogTransportsLossDuringAdmissionDoesNotReplay(t *testing.T) {
 			case <-entered:
 			case <-time.After(2 * time.Second):
 				t.Fatal("no preparation record")
+			}
+			// The preparation record precedes cmd.Start. Wait for the native
+			// side effect before dropping the session; otherwise the provider can
+			// exit before starting a child that teardown expects to reap.
+			// logs-hold keeps admission pending until log-admit is written below.
+			readPID(t, dir, "log-pid-one")
+			select {
+			case <-done:
+				t.Fatal("admission completed before transport loss")
+			default:
 			}
 			switch p := p.(type) {
 			case *Process:
@@ -314,10 +335,10 @@ func TestLogProcessRejectsBaselineTwo(t *testing.T) {
 }
 
 func TestLogTransportsRejectedLaunchAndUnavailableSources(t *testing.T) {
-	for _, reverse := range []bool{false, true} {
+	for _, transport := range []string{"process", "mtls", "key-tls", "key-http"} {
 		for _, mode := range []string{"logs-error", "logs-none"} {
-			t.Run(fmt.Sprintf("%v/%s", reverse, mode), func(t *testing.T) {
-				p, _ := logTransport(t, reverse, mode, nil)
+			t.Run(fmt.Sprintf("%s/%s", transport, mode), func(t *testing.T) {
+				p, _ := logTransport(t, transport, mode, nil)
 				var mu sync.Mutex
 				var text string
 				ss, h, e := p.Submit(context.Background(), launches("one"), api.SubmitOptions{Listener: &api.ListenOptions{Context: context.Background(), OnLog: func(_ context.Context, v api.LaunchLog) error {
@@ -355,9 +376,9 @@ func TestLogTransportsRejectedLaunchAndUnavailableSources(t *testing.T) {
 }
 
 func TestLogTransportsAdministrativeClose(t *testing.T) {
-	for _, reverse := range []bool{false, true} {
-		t.Run(fmt.Sprint(reverse), func(t *testing.T) {
-			p, _ := logTransport(t, reverse, "logs", nil)
+	for _, transport := range []string{"process", "mtls", "key-tls", "key-http"} {
+		t.Run(transport, func(t *testing.T) {
+			p, _ := logTransport(t, transport, "logs", nil)
 			_, h, e := p.Submit(context.Background(), launches("one"), api.SubmitOptions{Listener: &api.ListenOptions{Context: context.Background(), OnLog: func(context.Context, api.LaunchLog) error { return nil }}})
 			if e != nil {
 				t.Fatal(e)
@@ -374,9 +395,9 @@ func TestLogTransportsAdministrativeClose(t *testing.T) {
 }
 
 func TestLogTransportsKeepInputsOutOfOutputAndHealth(t *testing.T) {
-	for _, reverse := range []bool{false, true} {
-		t.Run(fmt.Sprint(reverse), func(t *testing.T) {
-			p, _ := logTransport(t, reverse, "logs-error", nil)
+	for _, transport := range []string{"process", "mtls", "key-tls", "key-http"} {
+		t.Run(transport, func(t *testing.T) {
+			p, _ := logTransport(t, transport, "logs-error", nil)
 			ls := launches("one")
 			ls[0].Lease = "private-lease-sentinel"
 			ls[0].Job.JobDB = "private-jobdb-sentinel"
@@ -392,7 +413,7 @@ func TestLogTransportsKeepInputsOutOfOutputAndHealth(t *testing.T) {
 			mu.Lock()
 			defer mu.Unlock()
 			health := fmt.Sprint(p.(interface{ Health() Health }).Health())
-			for _, sentinel := range []string{"private-lease-sentinel", "private-jobdb-sentinel", "mode: fixture", "executor-default", "PULSE_PLUGIN_COOKIE", "PLUGIN_CLIENT_CERT"} {
+			for _, sentinel := range []string{"private-lease-sentinel", "private-jobdb-sentinel", "mode: fixture", "executor-default", "PULSE_PLUGIN_COOKIE", "PLUGIN_CLIENT_CERT", string(testMutualKey("fixture"))} {
 				if strings.Contains(output, sentinel) || strings.Contains(health, sentinel) {
 					t.Fatal("private input escaped into logs or public health", sentinel)
 				}
@@ -402,9 +423,9 @@ func TestLogTransportsKeepInputsOutOfOutputAndHealth(t *testing.T) {
 }
 
 func TestLogTransportsFiniteBudgetExpiresDuringAdmission(t *testing.T) {
-	for _, reverse := range []bool{false, true} {
-		t.Run(fmt.Sprint(reverse), func(t *testing.T) {
-			p, dir := logTransport(t, reverse, "logs-hold", nil)
+	for _, transport := range []string{"process", "mtls", "key-tls", "key-http"} {
+		t.Run(transport, func(t *testing.T) {
+			p, dir := logTransport(t, transport, "logs-hold", nil)
 			canceled := make(chan struct{})
 			returned := make(chan struct{})
 			var h api.LogSubscription

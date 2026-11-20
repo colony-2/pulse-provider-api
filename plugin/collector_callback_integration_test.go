@@ -15,71 +15,75 @@ import (
 )
 
 func TestCollectorCallbackRealJoinLeaveReconnect(t *testing.T) {
-	tr := testTrust(t)
-	c := testCollector(t, collectorOptions(tr))
-	entered, release := make(chan struct{}), make(chan struct{})
-	defer func() {
-		select {
-		case <-release:
-		default:
-			close(release)
-		}
-	}()
-	log := make(chan ProviderChange, 10)
-	s := callbackSubscribe(t, c, func(ctx context.Context, v ProviderChange) {
-		if v.Kind == ProviderChangeInitial {
-			close(entered)
-			select {
-			case <-release:
-			case <-ctx.Done():
+	for _, mode := range reverseModes {
+		t.Run(mode, func(t *testing.T) {
+			tr := modeTrust(t, mode)
+			c := testCollector(t, collectorOptions(tr))
+			entered, release := make(chan struct{}), make(chan struct{})
+			defer func() {
+				select {
+				case <-release:
+				default:
+					close(release)
+				}
+			}()
+			log := make(chan ProviderChange, 10)
+			s := callbackSubscribe(t, c, func(ctx context.Context, v ProviderChange) {
+				if v.Kind == ProviderChangeInitial {
+					close(entered)
+					select {
+					case <-release:
+					case <-ctx.Done():
+					}
+				}
+				log <- v
+			})
+			<-entered
+			fast := make(chan ProviderChange, 10)
+			callbackSubscribe(t, c, func(_ context.Context, v ProviderChange) { fast <- v })
+			callbackEvent(t, fast)
+			var discoveries atomic.Int32
+			p := &reverseProvider{caps: func(context.Context) (api.Capabilities, error) { discoveries.Add(1); return api.Capabilities{}, nil }}
+			_, done := launchRun(t, factoryFor(p), runOptions(t, c, tr, "alpha"))
+			old := nextSnapshot(t, c, 1).Providers[0].Provider.(*Connection)
+			callbackEvent(t, fast)
+			if discoveries.Load() != 0 {
+				t.Fatal("callback performed discovery")
 			}
-		}
-		log <- v
-	})
-	<-entered
-	fast := make(chan ProviderChange, 10)
-	callbackSubscribe(t, c, func(_ context.Context, v ProviderChange) { fast <- v })
-	callbackEvent(t, fast)
-	var discoveries atomic.Int32
-	p := &reverseProvider{caps: func(context.Context) (api.Capabilities, error) { discoveries.Add(1); return api.Capabilities{}, nil }}
-	_, done := launchRun(t, factoryFor(p), runOptions(t, c, tr, "alpha"))
-	old := nextSnapshot(t, c, 1).Providers[0].Provider.(*Connection)
-	callbackEvent(t, fast)
-	if discoveries.Load() != 0 {
-		t.Fatal("callback performed discovery")
-	}
-	if _, e := old.GetCapabilities(context.Background()); e != nil {
-		t.Fatal(e)
-	}
-	if e := old.Close(); e != nil {
-		t.Fatal(e)
-	}
-	receiveRun(t, done)
-	callbackEvent(t, fast)
-	_, next := launchRun(t, factoryFor(p), runOptions(t, c, tr, "alpha"))
-	newer := nextSnapshot(t, c, 1).Providers[0]
-	callbackEvent(t, fast)
-	close(release)
-	initial, joined, left, rejoined := callbackEvent(t, log), callbackEvent(t, log), callbackEvent(t, log), callbackEvent(t, log)
-	if initial.Revision != 1 || joined.Revision != 2 || left.Revision != 3 || rejoined.Revision != 4 {
-		t.Fatal(initial, joined, left, rejoined)
-	}
-	if left.Reason != ProviderReasonAdministrativeClose || left.Left[0].Generation != old.g.id || rejoined.Joined[0].Generation != newer.Generation || newer.Generation <= old.g.id {
-		t.Fatal(left, rejoined)
-	}
-	if _, e := joined.Joined[0].Provider.GetCapabilities(context.Background()); !errors.Is(e, ErrUnavailable) {
-		t.Fatal("historical join revived", e)
-	}
-	if e := c.Close(); e != nil {
-		t.Fatal(e)
-	}
-	receiveRun(t, next)
-	final := callbackEvent(t, log)
-	if final.Kind != ProviderChangeStopped || final.Revision != 5 || final.Left[0].Generation != newer.Generation {
-		t.Fatal(final)
-	}
-	if e := callbackWait(t, s); e != nil {
-		t.Fatal(e)
+			if _, e := old.GetCapabilities(context.Background()); e != nil {
+				t.Fatal(e)
+			}
+			if e := old.Close(); e != nil {
+				t.Fatal(e)
+			}
+			receiveRun(t, done)
+			callbackEvent(t, fast)
+			_, next := launchRun(t, factoryFor(p), runOptions(t, c, tr, "alpha"))
+			newer := nextSnapshot(t, c, 1).Providers[0]
+			callbackEvent(t, fast)
+			close(release)
+			initial, joined, left, rejoined := callbackEvent(t, log), callbackEvent(t, log), callbackEvent(t, log), callbackEvent(t, log)
+			if initial.Revision != 1 || joined.Revision != 2 || left.Revision != 3 || rejoined.Revision != 4 {
+				t.Fatal(initial, joined, left, rejoined)
+			}
+			if left.Reason != ProviderReasonAdministrativeClose || left.Left[0].Generation != old.g.id || rejoined.Joined[0].Generation != newer.Generation || newer.Generation <= old.g.id {
+				t.Fatal(left, rejoined)
+			}
+			if _, e := joined.Joined[0].Provider.GetCapabilities(context.Background()); !errors.Is(e, ErrUnavailable) {
+				t.Fatal("historical join revived", e)
+			}
+			if e := c.Close(); e != nil {
+				t.Fatal(e)
+			}
+			receiveRun(t, next)
+			final := callbackEvent(t, log)
+			if final.Kind != ProviderChangeStopped || final.Revision != 5 || final.Left[0].Generation != newer.Generation {
+				t.Fatal(final)
+			}
+			if e := callbackWait(t, s); e != nil {
+				t.Fatal(e)
+			}
+		})
 	}
 }
 

@@ -309,4 +309,7 @@ snapshot per invocation as providers join and leave. Providers need no publicly
 addressable endpoint. Optional `OnProvidersChanged` subscriptions deliver an initial
 baseline and ordered join/leave details with bounded queues and explicit delivery
 failure. They complement the fresh invocation snapshots. See the [SDK's outbound connection guide](plugin/README.md#outbound-providers-and-the-central-collector)
-for mutual TLS, authorization, local configuration, and session safety.
+for default mutual TLS, identity-bound `mutual-key` authentication over verified
+TLS, explicit plaintext HTTP/2 for tests, stdin/environment key sources, and
+session safety. HTTP mode retains the custom reverse admission protocol; it does
+not expose a conventional HTTP endpoint.

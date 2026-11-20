@@ -13,59 +13,133 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/colony-2/pulse-provider-api/plugin"
 )
 
 func main() {
-	if run() != nil {
-		fmt.Fprintln(os.Stderr, "provider collection failed")
+	if e := run(); e != nil {
+		fmt.Fprintln(os.Stderr, "provider collection failed:", e)
 		os.Exit(1)
 	}
 }
 func run() error {
-	address := flag.String("listen", "127.0.0.1:0", "reachable TCP address")
-	ca := flag.String("ca", "", "trusted provider CA file")
-	cert := flag.String("cert", "", "host certificate file")
-	key := flag.String("key", "", "host private key file")
-	identities := flag.String("identities", "", "comma-separated authorized certificate DNS names")
-	flag.Parse()
-	pair, e := tls.LoadX509KeyPair(*cert, *key)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	// Reopening inherited Unix stdin registers pipes with Go's poller, including
+	// Go 1.22 where os.Stdin itself does not support read deadlines.
+	input := os.Stdin
+	if owned, e := os.Open("/dev/stdin"); e == nil {
+		input = owned
+		defer input.Close()
+	}
+	return runHost(ctx, os.Args[1:], input, os.Stdout)
+}
+
+func hostOptions(ctx context.Context, args []string, input *os.File, reader *bufio.Reader) (string, plugin.CollectorOptions, error) {
+	var opts plugin.CollectorOptions
+	flags := flag.NewFlagSet("reverse-host", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	address := flags.String("listen", "127.0.0.1:0", "reachable TCP address")
+	ca := flags.String("ca", "", "trusted provider CA file")
+	cert := flags.String("cert", "", "host certificate file")
+	key := flags.String("key", "", "host certificate private key file")
+	identities := flags.String("identities", "", "comma-separated authorized certificate DNS names")
+	auth := flags.String("auth", "mtls", "mtls or mutual-key")
+	transport := flags.String("transport", "tls", "tls or http (plaintext tests only)")
+	keyStdin := flags.Bool("auth-key-stdin", false, "read shared secret from first stdin line")
+	keyEnv := flags.String("auth-key-env", "", "environment variable containing shared secret")
+	keyID := flags.String("auth-key-id", "", "expected provider identity in key mode")
+	if flags.Parse(args) != nil || flags.NArg() != 0 {
+		return "", opts, plugin.ErrInvalid
+	}
+	a, t, e := plugin.ParseReverseModes(*auth, *transport)
 	if e != nil {
-		return e
+		return "", opts, e
 	}
-	b, e := os.ReadFile(*ca)
-	if e != nil {
-		return e
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(b) {
-		return plugin.ErrInvalid
-	}
-	allowed := strings.Split(*identities, ",")
-	listener, e := net.Listen("tcp", *address)
-	if e != nil {
-		return e
-	}
-	collector, e := plugin.StartCollector(context.Background(), listener, plugin.CollectorOptions{
-		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{plugin.ReverseALPN}, Certificates: []tls.Certificate{pair}, ClientCAs: pool, ClientAuth: tls.RequireAndVerifyClientCert},
-		Authorize: func(_ context.Context, s tls.ConnectionState) (string, error) {
-			for _, id := range allowed {
-				if id != "" && s.PeerCertificates[0].VerifyHostname(id) == nil {
-					return id, nil
-				}
-			}
-			return "", plugin.ErrUnavailable
-		},
+	opts.AuthMode, opts.Transport = a, t
+	identityFlag := false
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "identities" {
+			identityFlag = true
+		}
 	})
+	if a == plugin.ReverseAuthMutualKey {
+		if identityFlag || *keyID == "" || (*keyStdin == (*keyEnv != "")) {
+			return "", opts, plugin.ErrInvalid
+		}
+	} else if *keyStdin || *keyEnv != "" || *keyID != "" {
+		return "", opts, plugin.ErrInvalid
+	}
+	if t == plugin.ReverseTransportTLS {
+		pair, e := tls.LoadX509KeyPair(*cert, *key)
+		if e != nil {
+			return "", opts, plugin.ErrInvalid
+		}
+		opts.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{pair}, NextProtos: []string{plugin.ReverseKeyALPN}}
+		if a == plugin.ReverseAuthMTLS {
+			b, e := os.ReadFile(*ca)
+			if e != nil {
+				return "", opts, plugin.ErrInvalid
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(b) {
+				return "", opts, plugin.ErrInvalid
+			}
+			opts.TLSConfig.NextProtos = []string{plugin.ReverseALPN}
+			opts.TLSConfig.ClientCAs, opts.TLSConfig.ClientAuth = pool, tls.RequireAndVerifyClientCert
+			allowed := strings.Split(*identities, ",")
+			opts.Authorize = func(_ context.Context, s tls.ConnectionState) (string, error) {
+				for _, id := range allowed {
+					if id != "" && s.PeerCertificates[0].VerifyHostname(id) == nil {
+						return id, nil
+					}
+				}
+				return "", plugin.ErrUnavailable
+			}
+		}
+	} else if *ca != "" || *cert != "" || *key != "" {
+		return "", opts, plugin.ErrInvalid
+	}
+	if a == plugin.ReverseAuthMutualKey {
+		var secret []byte
+		if *keyStdin {
+			secret, e = plugin.LoadMutualKeyInput(ctx, input, reader)
+		} else {
+			secret, e = plugin.LoadMutualKey(plugin.MutualKeySource{EnvName: *keyEnv, LookupEnv: os.LookupEnv})
+		}
+		if e != nil {
+			return "", opts, e
+		}
+		opts.MutualKeys = map[string][]byte{*keyID: secret}
+	}
+	return *address, opts, nil
+}
+
+func runHost(ctx context.Context, args []string, input *os.File, stdout io.Writer) error {
+	reader := bufio.NewReader(input)
+	address, opts, e := hostOptions(ctx, args, input, reader)
+	if e != nil {
+		return e
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	listener, e := net.Listen("tcp", address)
+	if e != nil {
+		return e
+	}
+	collector, e := plugin.StartCollector(ctx, listener, opts)
 	if e != nil {
 		listener.Close()
 		return e
 	}
 	defer collector.Close()
-	output := &lockedWriter{Writer: os.Stdout}
+	output := &lockedWriter{Writer: stdout}
 	fmt.Fprintln(output, "listening="+listener.Addr().String())
 	observerContext, cancelObserver := context.WithCancel(context.Background())
 	defer cancelObserver()
@@ -89,12 +163,19 @@ func run() error {
 		}
 	}()
 	// The application supervisor must also observe fatal collection errors.
+	commandContext, cancelCommands := context.WithCancel(ctx)
+	defer cancelCommands()
+	defer input.Close()
 	lines := make(chan string)
 	go func() {
 		defer close(lines)
-		scanner := bufio.NewScanner(os.Stdin)
+		scanner := bufio.NewScanner(reader)
 		for scanner.Scan() {
-			lines <- scanner.Text()
+			select {
+			case lines <- scanner.Text():
+			case <-commandContext.Done():
+				return
+			}
 		}
 	}()
 	go func() { stopped <- collector.Wait() }()

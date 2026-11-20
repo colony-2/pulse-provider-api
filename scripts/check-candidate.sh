@@ -18,4 +18,7 @@ awk '$1 != "github.com/colony-2/pulse-provider-api"' go.sum > go.sum.candidate
 mv go.sum.candidate go.sum
 GOWORK=off go list -m -json github.com/colony-2/pulse-provider-api
 cd "$candidate_dir"
-make check-modules
+if [ "$#" -eq 0 ]; then
+  set -- check-modules
+fi
+make "$@"

@@ -21,6 +21,7 @@ import (
 )
 
 type reverseTrust struct {
+	mode   string
 	caKey  *ecdsa.PrivateKey
 	caCert *x509.Certificate
 
@@ -109,9 +110,25 @@ func (tr *reverseTrust) files(t *testing.T) string {
 	return dir
 }
 func collectorOptions(tr *reverseTrust) CollectorOptions {
-	return CollectorOptions{TLSConfig: tr.host, Authorize: func(_ context.Context, s tls.ConnectionState) (string, error) {
+	o := CollectorOptions{TLSConfig: tr.host, Authorize: func(_ context.Context, s tls.ConnectionState) (string, error) {
 		return s.PeerCertificates[0].Subject.CommonName, nil
 	}, StartupTimeout: time.Second, ShutdownTimeout: 500 * time.Millisecond, CallTimeout: time.Second, ProbeInterval: 20 * time.Millisecond, ProbeTimeout: 100 * time.Millisecond}
+	if tr.mode != "" && tr.mode != "mtls" {
+		o.AuthMode = ReverseAuthMutualKey
+		o.Authorize = nil
+		o.MutualKeys = map[string][]byte{}
+		for id := range tr.certs {
+			if id != "collector.test" {
+				o.MutualKeys[id] = testMutualKey(id)
+			}
+		}
+		if tr.mode == "key-http" {
+			o.Transport = ReverseTransportHTTP
+			o.TLSConfig = nil
+		}
+	}
+	return o
+
 }
 func testCollector(t *testing.T, o CollectorOptions) *Collector {
 	t.Helper()
@@ -129,7 +146,18 @@ func testCollector(t *testing.T, o CollectorOptions) *Collector {
 }
 func runOptions(t *testing.T, c *Collector, tr *reverseTrust, name string) RunOptions {
 	t.Helper()
-	return RunOptions{Address: c.listener.Addr().String(), TLSConfig: tr.clientFor(t, name), Init: Initialization{Name: name, BaseDir: t.TempDir(), ConfigYAML: []byte("base: test\n"), ExecutorEnv: map[string]string{"EXECUTOR_ONLY": "local"}}, StartupTimeout: time.Second, Serve: ServeOptions{ShutdownTimeout: 200 * time.Millisecond, FactoryTimeout: 500 * time.Millisecond}}
+	o := RunOptions{Address: c.listener.Addr().String(), TLSConfig: tr.clientFor(t, name), Init: Initialization{Name: name, BaseDir: t.TempDir(), ConfigYAML: []byte("base: test\n"), ExecutorEnv: map[string]string{"EXECUTOR_ONLY": "local"}}, StartupTimeout: time.Second, Serve: ServeOptions{ShutdownTimeout: 200 * time.Millisecond, FactoryTimeout: 500 * time.Millisecond}}
+	if tr.mode != "" && tr.mode != "mtls" {
+		o.AuthMode = ReverseAuthMutualKey
+		o.MutualKey = testMutualKey(name)
+		o.TLSConfig.Certificates = nil
+		if tr.mode == "key-http" {
+			o.Transport = ReverseTransportHTTP
+			o.TLSConfig = nil
+		}
+	}
+	return o
+
 }
 func launchRun(t *testing.T, f Factory, o RunOptions) (context.CancelFunc, <-chan error) {
 	t.Helper()
@@ -200,4 +228,29 @@ func (p *reverseProvider) List(ctx context.Context, q api.ListRequest) (api.List
 }
 func factoryFor(p api.Provider) Factory {
 	return func(context.Context, Init) (api.Provider, Cleanup, error) { return p, nil, nil }
+}
+
+var reverseModes = []string{"mtls", "key-tls", "key-http"}
+
+func testMutualKey(id string) []byte { return []byte(" disposable test key for " + id + " ") }
+func modeTrust(t *testing.T, mode string, names ...string) *reverseTrust {
+	tr := testTrust(t, names...)
+	tr.mode = mode
+	if mode != "mtls" {
+		tr.host.NextProtos = []string{ReverseKeyALPN}
+		tr.host.ClientAuth = tls.NoClientCert
+		tr.client.NextProtos = []string{ReverseKeyALPN}
+	}
+	return tr
+}
+
+func normalizeRunMode(o *RunOptions, mode string) {
+	if mode != "mtls" {
+		o.AuthMode = ReverseAuthMutualKey
+		o.MutualKey = testMutualKey("alpha")
+	}
+	if mode == "key-http" {
+		o.Transport = ReverseTransportHTTP
+		o.TLSConfig = nil
+	}
 }

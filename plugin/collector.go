@@ -179,7 +179,7 @@ func (c *Collector) admit(socket *sessionSocket) {
 	stop := context.AfterFunc(ctx, func() { _ = socket.Close() })
 	defer stop()
 	_ = socket.SetDeadline(time.Now().Add(c.opts.StartupTimeout))
-	tc := tls.Server(socket, c.opts.TLSConfig)
+	var tc net.Conn = socket
 	handed := false
 	defer func() {
 		if !handed {
@@ -189,10 +189,34 @@ func (c *Collector) admit(socket *sessionSocket) {
 			c.mu.Unlock()
 		}
 	}()
-	if tc.HandshakeContext(ctx) != nil || tc.ConnectionState().NegotiatedProtocol != reverseALPN {
-		return
+	var state tls.ConnectionState
+	if c.opts.Transport == ReverseTransportTLS {
+		secured := tls.Server(socket, c.opts.TLSConfig)
+		if secured.HandshakeContext(ctx) != nil || secured.ConnectionState().NegotiatedProtocol != reverseProtocol(c.opts.AuthMode) {
+			return
+		}
+		state = secured.ConnectionState()
+		tc = secured
 	}
-	id, e := c.opts.Authorize(ctx, tc.ConnectionState())
+	var id string
+	var e error
+	if c.opts.AuthMode == ReverseAuthMutualKey {
+		var key []byte
+		var deny bool
+		id, key, deny, e = readKeyRequest(tc)
+		if e != nil {
+			if deny {
+				_ = writeAdmission(tc, 1, "")
+			}
+			return
+		}
+		if !c.opts.matchesKey(id, key) {
+			_ = writeAdmission(tc, 1, "")
+			return
+		}
+	} else {
+		id, e = c.opts.Authorize(ctx, state)
+	}
 	if ctx.Err() != nil {
 		return
 	}

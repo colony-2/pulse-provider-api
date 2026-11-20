@@ -233,46 +233,79 @@ err := plugin.Run(providerContext, factory, plugin.RunOptions{
 })
 ```
 
-`Run` opens no listening port. It serves gRPC on its outbound TLS socket; the
+`Run` opens no listening port. It serves gRPC on its outbound authenticated socket; the
 collector adopts that accepted socket as its gRPC client exactly once. Both transports use the
 same baseline-3 messages, including independent observation streams. HashiCorp
 [go-plugin v1.6.2](https://github.com/hashicorp/go-plugin/tree/v1.6.2) explicitly
 excludes real-network plugins; this additive transport uses gRPC's socket
 adapters and the SDK's shared call safety instead of adding a tunnel library.
 
-The protocol layers, on exactly one connection, are:
+Authentication and transport are separate explicit selectors. Their zero values
+retain the existing certificate exchange:
 
-1. The provider is the TCP and TLS client; the collector accepts that connection.
-2. Mutual TLS 1.3 verifies both peers. ALPN must be
-   `pulse-provider-reverse/3`, not ordinary `h2` or `http/1.1`.
-3. Inside TLS, the collector writes `PPR3`, one status byte, a two-byte big-endian
-   identity length, and the authorized UTF-8 identity (at most 256 bytes).
-   Status 0 admits; 1 denies authorization or stopped collection; 2 means duplicate
-   reserved identity; 3 means provider capacity; 4 means generation exhaustion.
-   Rejections have zero identity length. These are fixed admission codes, not
-   provider method errors; incompatible SDK semantics fail subsequent `Negotiate`.
-4. The collector adopts that socket as the HTTP/2/gRPC client and sends the client
-   preface; the provider serves the protobuf service on its dialed
-   socket. `Negotiate` and successful `Initialize` precede ready publication.
+| `AuthMode` | `Transport` | Requirements |
+| --- | --- | --- |
+| `ReverseAuthMTLS` (default) | `ReverseTransportTLS` (default) | Verified mutual TLS 1.3 and `Authorize` |
+| `ReverseAuthMutualKey` | `ReverseTransportTLS` | Verified server TLS 1.3 and an identity-bound shared key |
+| `ReverseAuthMutualKey` | `ReverseTransportHTTP` | Plaintext **test environments only**, with an identity-bound key |
+| `ReverseAuthMTLS` | `ReverseTransportHTTP` | Invalid |
 
-HTTP/2 is required after admission; there is no HTTP/1 fallback, ordinary HTTPS
-endpoint, second tunnel connection, or standard gRPC TLS/ALPN handshake at that
-point. The gRPC adapter uses the already encrypted socket, not plaintext network
-transport. Use direct TCP or TCP passthrough; an ordinary HTTP proxy or HTTPS
-ingress cannot transparently carry this custom protocol. Callbacks are local
-notifications and add no wire messages, services, or tunnel dependencies.
+For key authentication, set `RunOptions.MutualKey` to the resolved bytes and
+`CollectorOptions.MutualKeys` to `map[string][]byte{"worker-alpha": expectedKey}`.
+Configure a distinct key for each identity. The collector validates every map
+entry at startup and authenticates before identity reservation, provider
+construction, or readiness. `Authorize` is required for mTLS and rejected in key
+mode; key material in mTLS mode is rejected. Unknown selectors fail with
+`ErrInvalid` before networking. One collector uses one mode pair, with no fallback.
 
-Both TLS configurations must require TLS 1.3 and exactly
-`NextProtos: []string{plugin.ReverseALPN}`. The host requires
-`RequireAndVerifyClientCert`, explicit `ClientCAs`, and a certificate. The provider
-requires explicit `RootCAs`, a verified `ServerName`, and a client certificate.
-Skip verification, weakened settings, and `GetConfigForClient` overrides are
-rejected. Certificate/key callbacks remain caller-owned and must be safe for
-concurrent use. Options copy initialization and trust pools. Authorization maps
-verified certificates to configured IDs of 1–256 UTF-8 bytes without control
-characters; do not authorize an unverified claimed name. The host must scope
-credentials to the intended tenant/environment. Renewal affects new sessions;
-close existing handles and reject reauthorization to revoke them.
+Both TLS configurations require TLS 1.3, ordinary certificate verification, and
+exactly one ALPN: `ReverseALPN` (`pulse-provider-reverse/3`) for mTLS, or
+`ReverseKeyALPN` (`pulse-provider-reverse-key/3`) for key mode. mTLS requires host
+`ClientAuth: tls.RequireAndVerifyClientCert`, explicit `ClientCAs`, a host
+certificate, and provider `RootCAs`, verified `ServerName`, and client certificate.
+Key TLS requires a host certificate and `ClientAuth: tls.NoClientCert`, plus
+provider `RootCAs` and verified `ServerName`; no provider certificate is needed.
+In HTTP mode both `TLSConfig` fields must be nil. Skip verification, weakened TLS,
+and `GetConfigForClient` overrides are rejected. Certificate/key callbacks remain
+caller-owned and must be safe for concurrent use.
+
+The protocol layers use exactly one outbound provider TCP connection:
+
+1. When selected, TLS verifies the server (and the provider in mTLS mode).
+2. In key mode only, the provider writes `PPK1`, one key-type byte (`1`), two
+   unsigned big-endian 16-bit lengths (identity then key), followed by identity
+   and key bytes. Identities are case-sensitive UTF-8, 1–256 bytes, without control
+   characters. Keys are exact nonempty byte strings up to 4096 bytes without CR
+   or LF; spaces are significant. Other key types are reserved and rejected.
+   The collector hashes configured and presented keys with SHA-256 and compares
+   fixed-size digests using `crypto/subtle`, including a dummy comparison for
+   unknown identities. This is not password hardening or constant-time ID lookup.
+3. The collector writes the existing `PPR3`, one status byte, a two-byte big-endian
+   identity length, and the configured identity. Status 0 admits; 1 generically
+   denies; 2 means duplicate reserved identity; 3 means provider capacity; 4 means
+   generation exhaustion. Rejections have zero identity length and reflect no
+   secrets. The provider checks the admitted identity against its local name.
+4. The collector adopts that socket as its HTTP/2/gRPC client; the provider serves
+   the existing protobuf service on its dialed socket. `Negotiate` and successful
+   `Initialize` precede ready publication. Callbacks remain local notifications.
+
+`http` means plaintext reverse HTTP/2 **after this custom admission exchange**.
+It exposes the key and all provider traffic, provides no server authentication,
+and offers no replay protection. Use disposable keys in isolated test environments.
+It is not an ordinary HTTP/1 endpoint or standard h2c URL. Use direct TCP or TCP
+passthrough: ordinary HTTP proxies and HTTPS ingress cannot transparently carry
+this protocol. No provider listener, second tunnel, new service, or protobuf
+change is involved.
+
+Existing mTLS users need no changes. Key users must upgrade both ends and select
+matching auth and transport modes. Mixed fleets need separate collectors or a
+coordinated cutover. Options copy initialization, key bytes, key maps (as private
+digests), and trust pools at startup; callers must not mutate them concurrently
+with startup. Later mutations do not rotate credentials. Replace the collector
+and provider lifecycles and close existing sessions to revoke a key. Scope
+credentials to their intended tenant/environment and prefer randomly generated
+secrets. Other key types, reciprocal challenges, expiration, and live rotation
+are deferred.
 
 Initialization belongs to the provider machine: the host supplies only its
 authorized identity. Host config, paths, executor-default overrides, and identity
@@ -284,12 +317,12 @@ message, concurrency, and probe bounds. Additional finite defaults are 128
 providers, 32 pending connections/authorization callbacks, 1024 change waiters,
 and 16 KiB incoming HTTP/2 metadata (provider side also 16 KiB). The provider
 reserves business concurrency, log subscription capacity, and two control streams. Excess admissions
-do not displace ready providers. TLS and authorization share the startup bound;
+do not displace ready providers. TLS, key exchange, admission, and initialization share the startup bound;
 a callback ignoring cancellation keeps its work slot until it returns.
 
 `Run` reconnects only when explicitly enabled through `Reconnect RestartPolicy`.
 It reuses bounded delay, multiplier, jitter, and healthy-reset conventions, with
-no replacement until the old session's cleanup succeeds. Certificate, identity,
+no replacement until the old session's cleanup succeeds. Certificate, key, identity,
 admission, negotiation, and initialization rejection are terminal. Reconnecting
 never queues, resends, or resolves a previous submission. A received shutdown
 returns nil unless cleanup failed; context cancellation returns its context error.
@@ -304,13 +337,60 @@ forced termination is needed. These network checks run on Linux; additional
 platform certification and production Pulse listener/handler wiring are separate.
 
 The independent commands in `examples/reverse-host` and
-`examples/reverse-provider` load certificates and provider YAML from explicit
-files. The host handles repeated `invoke` lines on stdin. The standard-library
-`scripts/reverse-consumer.go` helper generates temporary trust and exercises both
-commands, including joins and departures, without Pulse or a provider listener.
-The host registers one callback subscription, distinguishes event output from
-invocation results, and supervises delivery failure. The consumer checks its
-initial baseline, ordered generation-aware deltas, and final stopped event.
+`examples/reverse-provider` accept `-auth mtls|mutual-key` and
+`-transport tls|http`, retaining mTLS/TLS defaults. `-key` still names a certificate
+private-key file. For shared secrets choose exactly one of `-auth-key-stdin` or
+`-auth-key-env NAME`; the host also requires `-auth-key-id ID` for its single
+expected identity. Embedded collectors can bind several identities to distinct
+keys. Certificate `-identities` is rejected in key mode.
+
+For example, with a key already supplied through each process's environment:
+
+```sh
+# Server-verified TLS; the provider does not need a client certificate.
+go run ./examples/reverse-host -listen 127.0.0.1:8443 \
+  -auth mutual-key -auth-key-id worker-alpha -auth-key-env PROVIDER_KEY \
+  -cert collector.crt -key collector.key
+go run ./examples/reverse-provider -address 127.0.0.1:8443 -name worker-alpha \
+  -auth mutual-key -auth-key-env PROVIDER_KEY \
+  -ca ca.crt -server-name collector.test -config provider.yaml
+
+# Explicit plaintext testing; these example values are disposable.
+{ printf 'disposable-test-key\n'; cat; } | go run ./examples/reverse-host \
+  -listen 127.0.0.1:8443 -auth mutual-key -transport http -auth-key-id worker-alpha -auth-key-stdin
+printf 'disposable-test-key\n' | go run ./examples/reverse-provider \
+  -address 127.0.0.1:8443 -name worker-alpha -config provider.yaml \
+  -auth mutual-key -transport http -auth-key-stdin
+```
+
+Run the host and provider in separate terminals. The host's `cat` keeps the pipe
+open for `invoke` and `quit` commands after its first key line. Neither source
+puts a real key on the command line.
+`LoadMutualKey(MutualKeySource{Stdin: reader})` reads the first bounded line,
+removing only its terminal LF or CRLF; nonempty EOF is accepted. Environment
+loading uses explicit `EnvName` and injected `LookupEnv`. Missing, empty,
+multiline, oversized, or conflicting sources fail without exposing values or
+underlying reader errors. The SDK never implicitly reads globals; `Run` accepts
+only resolved bytes. It never injects a key into initialization, YAML, RPC
+metadata, executor defaults, or callbacks. Original process environment and
+native executor inheritance remain the embedding application's responsibility.
+
+The host uses the same buffered reader for its key and subsequent `invoke` /
+`quit` commands, preserving prefetched lines. The provider ignores later lines.
+The examples bound owned stdin acquisition to 30 seconds and honor interruption
+before opening sockets. On Unix they reopen `/dev/stdin` so inherited pipes
+support deadlines under Go 1.22. Inputs or platforms without interruptible read
+support fail with guidance to use the environment source. The synchronous SDK
+loader itself cannot cancel an arbitrary reader; `LoadMutualKeyInput` handles an
+explicitly owned deadline-capable file and clears its deadline afterward.
+
+The standard-library `scripts/reverse-consumer.go` helper generates temporary
+trust and runs the copied commands under Go 1.22.12. It requires the legacy mTLS
+two-provider join/departure and ordered callback scenario, plus separate alpha
+and beta key scenarios on TLS and plaintext using both sources. Child output is
+captured and checked for accidental key disclosure. `TestIndependentConsumersAndExamples`
+asserts every scenario, including local subprocess compatibility; the published
+consumer check runs the same helper without a module replacement.
 
 ## API results and submission uncertainty
 

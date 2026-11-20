@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"net"
 	"path/filepath"
@@ -10,10 +11,46 @@ import (
 	"time"
 )
 
+// ReverseAuth selects how the collector authenticates a provider.
+type ReverseAuth uint8
+
+const (
+	ReverseAuthMTLS ReverseAuth = iota
+	ReverseAuthMutualKey
+)
+
+// ReverseTransport selects encryption for the reverse HTTP/2 socket.
+type ReverseTransport uint8
+
+const (
+	ReverseTransportTLS ReverseTransport = iota
+	// ReverseTransportHTTP exposes credentials and traffic; use only for tests.
+	ReverseTransportHTTP
+)
+
+func reverseMode(auth ReverseAuth, transport ReverseTransport) error {
+	if auth > ReverseAuthMutualKey || transport > ReverseTransportHTTP || (auth == ReverseAuthMTLS && transport == ReverseTransportHTTP) {
+		return ErrInvalid
+	}
+	return nil
+}
+func reverseProtocol(auth ReverseAuth) string {
+	if auth == ReverseAuthMutualKey {
+		return ReverseKeyALPN
+	}
+	return ReverseALPN
+}
+
 // CollectorOptions configures authenticated provider collection. Authorize maps
 // an ordinarily verified certificate to a configured, case-sensitive identity.
 type CollectorOptions struct {
-	LogOptions                                                        LogOptions
+	LogOptions LogOptions
+	AuthMode   ReverseAuth
+	Transport  ReverseTransport
+	// MutualKeys binds each allowed identity to an exact shared secret. Copied and
+	// hashed at startup; rotation requires replacing the collector and sessions.
+	MutualKeys                                                        map[string][]byte
+	keyDigests                                                        map[string][sha256.Size]byte
 	TLSConfig                                                         *tls.Config
 	Authorize                                                         func(context.Context, tls.ConnectionState) (string, error)
 	StartupTimeout, CallTimeout, ShutdownTimeout                      time.Duration
@@ -27,6 +64,10 @@ type CollectorOptions struct {
 // RunOptions constructs providers using local configuration, never host paths.
 // Reconnect is disabled by default and applies only to transient transport loss.
 type RunOptions struct {
+	AuthMode  ReverseAuth
+	Transport ReverseTransport
+	// MutualKey is copied before the first connection. Run never reads process input.
+	MutualKey      []byte
 	Address        string
 	TLSConfig      *tls.Config
 	Init           Initialization
@@ -40,10 +81,27 @@ func (o *CollectorOptions) defaults() error {
 		return e
 	}
 	var e error
-	if o.Authorize == nil {
-		return ErrInvalid
+	if e = reverseMode(o.AuthMode, o.Transport); e != nil {
+		return e
 	}
-	if o.TLSConfig, e = reverseTLS(o.TLSConfig, true); e != nil {
+	if o.AuthMode == ReverseAuthMTLS {
+		if o.Authorize == nil || len(o.MutualKeys) != 0 {
+			return ErrInvalid
+		}
+	} else {
+		if o.Authorize != nil || len(o.MutualKeys) == 0 {
+			return ErrInvalid
+		}
+		o.keyDigests = make(map[string][sha256.Size]byte, len(o.MutualKeys))
+		for id, key := range o.MutualKeys {
+			if !validIdentity(id) || !validMutualKey(key) {
+				return ErrInvalid
+			}
+			o.keyDigests[id] = sha256.Sum256(key)
+		}
+		o.MutualKeys = nil
+	}
+	if o.TLSConfig, e = reverseTLS(o.TLSConfig, true, o.AuthMode, o.Transport); e != nil {
 		return e
 	}
 	if e = limits(&o.MaxMessageBytes, &o.Concurrency); e != nil {
@@ -92,7 +150,20 @@ func (o *RunOptions) defaults() error {
 			return ErrInvalid
 		}
 	}
-	if o.TLSConfig, e = reverseTLS(o.TLSConfig, false); e != nil {
+	if e = reverseMode(o.AuthMode, o.Transport); e != nil {
+		return e
+	}
+	if o.AuthMode == ReverseAuthMTLS {
+		if len(o.MutualKey) != 0 {
+			return ErrInvalid
+		}
+	} else {
+		if !validMutualKey(o.MutualKey) {
+			return ErrInvalid
+		}
+		o.MutualKey = append([]byte(nil), o.MutualKey...)
+	}
+	if o.TLSConfig, e = reverseTLS(o.TLSConfig, false, o.AuthMode, o.Transport); e != nil {
 		return e
 	}
 	if e = o.Serve.defaults(); e != nil {
@@ -107,4 +178,27 @@ func (o *RunOptions) defaults() error {
 
 	o.Init = copyInitialization(o.Init)
 	return nil
+}
+
+// ParseReverseModes parses the example CLI selectors without accessing input.
+func ParseReverseModes(auth, transport string) (ReverseAuth, ReverseTransport, error) {
+	var a ReverseAuth
+	var t ReverseTransport
+	switch auth {
+	case "mtls":
+		a = ReverseAuthMTLS
+	case "mutual-key":
+		a = ReverseAuthMutualKey
+	default:
+		return 0, 0, ErrInvalid
+	}
+	switch transport {
+	case "tls":
+		t = ReverseTransportTLS
+	case "http":
+		t = ReverseTransportHTTP
+	default:
+		return 0, 0, ErrInvalid
+	}
+	return a, t, reverseMode(a, t)
 }

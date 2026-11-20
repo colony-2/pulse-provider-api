@@ -1,6 +1,6 @@
 schema_version: 2
 id: provider-plugin-verify
-version: 0.4.1
+version: 0.6.0
 inputs:
   api_version: ${{ inputs.api_version }}
   base: ${{ inputs.base }}
@@ -34,7 +34,7 @@ input_schema:
 outputs:
   api_version: c2.build-hook/v1
   status: '${{ sequence.checks.outputs.exit_code == 0 ? "passed" : "failed" }}'
-  summary: '${{ sequence.checks.outputs.exit_code == 0 ? "Both candidate modules, partial coverage metadata bounds, remote listener capacity categories, admission independence, both log transports, callback bounds, collector regressions, Go 1.22 consumers, vet, race, tidiness and reproducible generation passed." : "Required provider/plugin acceptance failed; inspect error/plugin-checks.log." }}'
+  summary: '${{ sequence.checks.outputs.exit_code == 0 ? "Both candidate modules, mutual-key TLS/HTTP authentication and bounded key sources, partial coverage metadata bounds, remote listener capacity categories, admission independence, all log transports, repeated admission-loss race checks, callback bounds, collector regressions, Go 1.22 consumers, vet, race, tidiness and reproducible generation passed." : "Required provider/plugin acceptance failed; inspect error/plugin-checks.log." }}'
   artifact_refs:
     error/plugin-checks.log: ${{ sequence.checks.artifacts['error/plugin-checks.log'] }}
 sequence:
@@ -46,7 +46,9 @@ sequence:
       run: |
         set -eu
         mkdir -p "$OUTBOX/error"
-        {
+        # Preserve the failing status and expose diagnostics in the task log too.
+        trap 'verify_status=$?; if [ "$verify_status" -ne 0 ]; then cat "$OUTBOX/error/plugin-checks.log" >&2; fi; exit "$verify_status"' EXIT
+        (
           git rev-parse HEAD
           git status --short
           verify_index=$(mktemp)
@@ -54,5 +56,7 @@ sequence:
           GIT_INDEX_FILE="$verify_index" git add -A
           GIT_INDEX_FILE="$verify_index" git write-tree
           rm -f "$verify_index"
+          # Includes ten admission-loss race repetitions across all transports.
+          make reverse-auth-check
           make check
-        } > "$OUTBOX/error/plugin-checks.log" 2>&1
+        ) > "$OUTBOX/error/plugin-checks.log" 2>&1

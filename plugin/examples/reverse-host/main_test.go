@@ -1,10 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
+	"io"
+	"net"
+	"os"
+	"strings"
 	"testing"
+	"time"
 
 	api "github.com/colony-2/pulse-provider-api"
 	"github.com/colony-2/pulse-provider-api/plugin"
@@ -98,5 +104,72 @@ func TestHostSupervisesSubscriptionFailure(t *testing.T) {
 	line := changeLine(plugin.ProviderChange{Kind: plugin.ProviderChangeMembership, Revision: 4, Reason: plugin.ProviderReasonConnectionLost, Left: []plugin.AvailableProvider{{ID: "alpha", Generation: 1}}})
 	if line != "change kind=membership revision=4 reason=connection_lost joined= left=alpha/1" {
 		t.Fatal(line)
+	}
+}
+
+func TestHostKeyAndCommandsShareInput(t *testing.T) {
+	input, writer, e := os.Pipe()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer input.Close()
+	defer writer.Close()
+	_, _ = io.WriteString(writer, " disposable key \ninvoke\nquit\n")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var out bytes.Buffer
+	if e = runHost(ctx, []string{"-auth", "mutual-key", "-transport", "http", "-auth-key-stdin", "-auth-key-id", "alpha"}, input, &out); e != nil {
+		t.Fatal(e)
+	}
+	if !strings.Contains(out.String(), "revision=1 providers=\n") || strings.Contains(out.String(), "disposable") {
+		t.Fatal(out.String())
+	}
+}
+func TestHostKeyInputStopsBeforeListening(t *testing.T) {
+	for _, kind := range []string{"cancel", "timeout"} {
+		t.Run(kind, func(t *testing.T) {
+			input, writer, e := os.Pipe()
+			if e != nil {
+				t.Fatal(e)
+			}
+			defer input.Close()
+			defer writer.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+			defer cancel()
+			if kind == "cancel" {
+				cancel()
+			}
+			// A premature Listen would fail with a bind error rather than the input error.
+			reserved, e := net.Listen("tcp", "127.0.0.1:0")
+			if e != nil {
+				t.Fatal(e)
+			}
+			defer reserved.Close()
+			var out bytes.Buffer
+			if e = runHost(ctx, []string{"-listen", reserved.Addr().String(), "-auth", "mutual-key", "-transport", "http", "-auth-key-stdin", "-auth-key-id", "alpha"}, input, &out); e == nil || !strings.Contains(e.Error(), "key input unavailable") || out.Len() != 0 {
+				t.Fatal(e, out.String())
+			}
+			// An interrupted acquisition finished reading, and cleared its deadline.
+			_, _ = io.WriteString(writer, "next\n")
+			line, e := bufio.NewReader(input).ReadString('\n')
+			if e != nil || line != "next\n" {
+				t.Fatal(line, e)
+			}
+		})
+	}
+}
+func TestHostInvalidKeyFlags(t *testing.T) {
+	for _, args := range [][]string{
+		{"-auth", "unknown"}, {"-transport", "http"},
+		{"-auth", "mutual-key", "-transport", "http", "-auth-key-id", "alpha"},
+		{"-auth", "mutual-key", "-transport", "http", "-auth-key-stdin"},
+		{"-auth", "mutual-key", "-transport", "http", "-auth-key-id", "alpha", "-auth-key-stdin", "-auth-key-env", "KEY"},
+		{"-auth", "mutual-key", "-transport", "http", "-auth-key-id", "alpha", "-auth-key-stdin", "-identities", "alpha"},
+		{"-auth-key-env", "KEY"},
+	} {
+		_, _, e := hostOptions(context.Background(), args, nil, nil)
+		if !errors.Is(e, plugin.ErrInvalid) {
+			t.Fatal(args, e)
+		}
 	}
 }

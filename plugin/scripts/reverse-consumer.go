@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -36,7 +37,7 @@ func run() error {
 		return e
 	}
 	defer os.RemoveAll(dir)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	caKey, e := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if e != nil {
@@ -256,5 +257,156 @@ func run() error {
 	}
 	fmt.Println("independent callback baseline, ordered deltas and stopped delivery passed")
 	fmt.Println("independent reverse collector join/leave verification passed")
+	return keyScenarios(ctx, dir, tlsArgs)
+}
+
+// Run each identity with its own secret and collector. Both source variants are
+// required on both transports; no mode may be skipped and reported as passed.
+func keyScenarios(ctx context.Context, dir string, tlsArgs func(string) []string) error {
+	for _, transport := range []string{"tls", "http"} {
+		for _, source := range []string{"env", "stdin"} {
+			for _, id := range []string{"alpha", "beta"} {
+				if e := keyScenario(ctx, dir, tlsArgs, transport, source, id); e != nil {
+					return fmt.Errorf("key %s/%s/%s: %w", transport, source, id, e)
+				}
+				fmt.Printf("independent mutual-key %s %s %s passed\n", transport, source, id)
+			}
+		}
+	}
+	return nil
+}
+func keyScenario(ctx context.Context, dir string, tlsArgs func(string) []string, transport, source, id string) error {
+	secret := " disposable independent key for " + id + " "
+	common := []string{"-auth", "mutual-key", "-transport", transport}
+	if source == "env" {
+		common = append(common, "-auth-key-env", "REVERSE_CONSUMER_KEY")
+	} else {
+		common = append(common, "-auth-key-stdin")
+	}
+	hostArgs := append(append([]string{}, common...), "-auth-key-id", id)
+	if transport == "tls" {
+		hostArgs = append(hostArgs, tlsArgs("collector.test")[2:]...)
+	}
+	host := exec.CommandContext(ctx, os.Args[1], hostArgs...)
+	var hostError, providerOutput bytes.Buffer
+	host.Stderr = &hostError
+	if source == "env" {
+		host.Env = append(os.Environ(), "REVERSE_CONSUMER_KEY="+secret)
+	}
+	input, e := host.StdinPipe()
+	if e != nil {
+		return e
+	}
+	output, e := host.StdoutPipe()
+	if e != nil {
+		return e
+	}
+	if e = host.Start(); e != nil {
+		return e
+	}
+	defer func() { _ = host.Process.Kill(); _ = host.Wait() }()
+	if source == "stdin" {
+		if _, e = io.WriteString(input, secret+"\ninvoke\n"); e != nil {
+			return e
+		}
+	}
+	scanner := bufio.NewScanner(output)
+	var lines []string
+	scan := func() bool {
+		if !scanner.Scan() {
+			return false
+		}
+		lines = append(lines, scanner.Text())
+		return true
+	}
+	if !scan() || !strings.HasPrefix(scanner.Text(), "listening=") {
+		return fmt.Errorf("collector did not start")
+	}
+	address := strings.TrimPrefix(scanner.Text(), "listening=")
+	args := append(append([]string{}, common...), "-name", id, "-address", address, "-config", filepath.Join(dir, "config.yaml"))
+	if transport == "tls" {
+		args = append(args, "-ca", filepath.Join(dir, "ca.crt"), "-server-name", "collector.test")
+	}
+	provider := exec.CommandContext(ctx, os.Args[2], args...)
+	provider.Stdout, provider.Stderr = &providerOutput, &providerOutput
+	if source == "env" {
+		provider.Env = append(os.Environ(), "REVERSE_CONSUMER_KEY="+secret)
+	} else {
+		provider.Stdin = strings.NewReader(secret + "\nunused provider input\n")
+	}
+	if e = provider.Start(); e != nil {
+		return e
+	}
+	defer func() { _ = provider.Process.Kill(); _ = provider.Wait() }()
+
+	waitMembership := func(expected string) error {
+		for {
+			if _, e := io.WriteString(input, "invoke\n"); e != nil {
+				return e
+			}
+			scanned := false
+			for scan() {
+				scanned = true
+				line := scanner.Text()
+				if strings.HasPrefix(line, "change ") {
+					continue
+				}
+				if strings.HasSuffix(line, " providers="+expected) {
+					return nil
+				}
+				break
+			}
+			if !scanned {
+				return fmt.Errorf("collector output ended before expected membership")
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}
+	if e = waitMembership(id + "/1"); e != nil {
+		return e
+	}
+	if e = provider.Process.Signal(os.Interrupt); e != nil {
+		return e
+	}
+	if e = provider.Wait(); e != nil {
+		return fmt.Errorf("provider shutdown failed: %s", strings.ReplaceAll(providerOutput.String(), secret, "[redacted]"))
+	}
+	// Wait for departure before shutdown so disposal never races a killed peer.
+	if e = waitMembership(""); e != nil {
+		return e
+	}
+	if _, e = io.WriteString(input, "quit\n"); e != nil {
+		return e
+	}
+	for scan() {
+	}
+	if e = host.Wait(); e != nil {
+		return fmt.Errorf("collector shutdown failed: %s", strings.ReplaceAll(hostError.String(), secret, "[redacted]"))
+	}
+	joined, left, stopped := false, false, false
+	for _, line := range lines {
+		if strings.Contains(line, "kind=membership") && strings.Contains(line, "joined="+id+"/1") {
+			joined = true
+		}
+		if strings.Contains(line, "kind=membership") && strings.Contains(line, "left="+id+"/1") {
+			left = true
+		}
+		if strings.Contains(line, "kind=stopped") {
+			stopped = true
+		}
+	}
+	if !joined || !left || !stopped {
+		return fmt.Errorf("membership callbacks missing")
+	}
+	if strings.Contains(strings.Join(lines, "\n")+hostError.String()+providerOutput.String(), secret) {
+		return fmt.Errorf("credential disclosed in child output")
+	}
+	if scanner.Err() != nil {
+		return fmt.Errorf("collector output failed")
+	}
 	return nil
 }

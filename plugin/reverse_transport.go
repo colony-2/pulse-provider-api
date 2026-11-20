@@ -17,6 +17,9 @@ import (
 // ReverseALPN distinguishes reverse provider sessions from ordinary gRPC.
 const ReverseALPN = "pulse-provider-reverse/3"
 
+// ReverseKeyALPN isolates key admission from the legacy certificate exchange.
+const ReverseKeyALPN = "pulse-provider-reverse-key/3"
+
 const reverseALPN = ReverseALPN
 
 func validIdentity(id string) bool {
@@ -33,19 +36,37 @@ func validIdentity(id string) bool {
 
 // Dynamic TLS configurations could bypass the required verification settings.
 // Callers can rotate credentials by supplying fresh options to a new lifecycle.
-func reverseTLS(in *tls.Config, host bool) (*tls.Config, error) {
+func reverseTLS(in *tls.Config, host bool, auth ReverseAuth, transport ReverseTransport) (*tls.Config, error) {
+	if transport == ReverseTransportHTTP {
+		if in != nil {
+			return nil, ErrInvalid
+		}
+		return nil, nil
+	}
 	if in == nil || in.InsecureSkipVerify || in.GetConfigForClient != nil || in.MinVersion < tls.VersionTLS13 || (in.MaxVersion != 0 && in.MaxVersion < tls.VersionTLS13) {
 		return nil, ErrInvalid
 	}
-	if len(in.NextProtos) != 1 || in.NextProtos[0] != reverseALPN {
+	if len(in.NextProtos) != 1 || in.NextProtos[0] != reverseProtocol(auth) {
 		return nil, ErrInvalid
 	}
 	if host {
-		if in.ClientAuth != tls.RequireAndVerifyClientCert || in.ClientCAs == nil || (len(in.Certificates) == 0 && in.GetCertificate == nil) {
+		if len(in.Certificates) == 0 && in.GetCertificate == nil {
 			return nil, ErrInvalid
 		}
-	} else if in.RootCAs == nil || in.ServerName == "" || (len(in.Certificates) == 0 && in.GetClientCertificate == nil) {
-		return nil, ErrInvalid
+		if auth == ReverseAuthMTLS {
+			if in.ClientAuth != tls.RequireAndVerifyClientCert || in.ClientCAs == nil {
+				return nil, ErrInvalid
+			}
+		} else if in.ClientAuth != tls.NoClientCert {
+			return nil, ErrInvalid
+		}
+	} else {
+		if in.RootCAs == nil || in.ServerName == "" {
+			return nil, ErrInvalid
+		}
+		if auth == ReverseAuthMTLS && len(in.Certificates) == 0 && in.GetClientCertificate == nil {
+			return nil, ErrInvalid
+		}
 	}
 	c := in.Clone()
 	c.NextProtos = append([]string(nil), in.NextProtos...)

@@ -28,7 +28,8 @@ func appendEvent(dir, s string) {
 	}
 	defer f.Close()
 	_, _ = fmt.Fprintln(f, s)
-	_ = f.Sync()
+	// Tests observe writes through the filesystem; crash durability is unrelated
+	// to the fixture contract. Avoid disk flushes inside bounded RPC/cleanup work.
 }
 func waitFile(ctx context.Context, path string) {
 	t := time.NewTicker(5 * time.Millisecond)
@@ -125,7 +126,9 @@ func main() {
 	var e error
 	if len(os.Args) > 1 && os.Args[1] == "reverse" {
 		dir := os.Getenv("EVENT_DIR")
-		e = plugin.Run(context.Background(), factory, plugin.RunOptions{Address: os.Args[2], TLSConfig: fixtureTLS(os.Args[3], false), Init: plugin.Initialization{Name: "fixture", BaseDir: dir, ConfigYAML: []byte("mode: fixture\n"), ExecutorEnv: map[string]string{"EXECUTOR_ONLY": "executor-default"}}, Serve: opts, StartupTimeout: time.Second})
+		o := plugin.RunOptions{Address: os.Args[2], TLSConfig: fixtureTLS(os.Args[3], false), Init: plugin.Initialization{Name: "fixture", BaseDir: dir, ConfigYAML: []byte("mode: fixture\n"), ExecutorEnv: map[string]string{"EXECUTOR_ONLY": "executor-default"}}, Serve: opts, StartupTimeout: time.Second}
+		fixtureRunMode(&o)
+		e = plugin.Run(context.Background(), factory, o)
 	} else {
 		e = plugin.Serve(factory, opts)
 	}
@@ -346,7 +349,35 @@ func fixtureTLS(dir string, host bool) *tls.Config {
 		c.ClientCAs = pool
 		c.ClientAuth = tls.RequireAndVerifyClientCert
 	}
+
+	if os.Getenv("REVERSE_MODE") == "key-tls" {
+		c.NextProtos = []string{plugin.ReverseKeyALPN}
+		c.ClientAuth = tls.NoClientCert
+	}
 	return c
+}
+func fixtureRunMode(o *plugin.RunOptions) {
+	mode := os.Getenv("REVERSE_MODE")
+	if mode == "key-tls" || mode == "key-http" {
+		o.AuthMode = plugin.ReverseAuthMutualKey
+		o.MutualKey = []byte(" disposable test key for fixture ")
+	}
+	if mode == "key-http" {
+		o.Transport = plugin.ReverseTransportHTTP
+		o.TLSConfig = nil
+	}
+}
+func fixtureCollectorMode(o *plugin.CollectorOptions) {
+	mode := os.Getenv("REVERSE_MODE")
+	if mode == "key-tls" || mode == "key-http" {
+		o.AuthMode = plugin.ReverseAuthMutualKey
+		o.Authorize = nil
+		o.MutualKeys = map[string][]byte{"fixture": []byte(" disposable test key for fixture ")}
+	}
+	if mode == "key-http" {
+		o.Transport = plugin.ReverseTransportHTTP
+		o.TLSConfig = nil
+	}
 }
 func reverseHost() {
 	dir := os.Args[2]
@@ -355,12 +386,14 @@ func reverseHost() {
 	if e != nil {
 		os.Exit(2)
 	}
-	collector, e := plugin.StartCollector(context.Background(), listener, plugin.CollectorOptions{TLSConfig: fixtureTLS(trustDir, true), Authorize: func(_ context.Context, s tls.ConnectionState) (string, error) {
+	co := plugin.CollectorOptions{TLSConfig: fixtureTLS(trustDir, true), Authorize: func(_ context.Context, s tls.ConnectionState) (string, error) {
 		if s.PeerCertificates[0].VerifyHostname("fixture") != nil {
 			return "", plugin.ErrInvalid
 		}
 		return "fixture", nil
-	}, ProbeInterval: 30 * time.Millisecond, ProbeTimeout: 100 * time.Millisecond, ShutdownTimeout: 500 * time.Millisecond})
+	}, ProbeInterval: 30 * time.Millisecond, ProbeTimeout: 100 * time.Millisecond, ShutdownTimeout: 500 * time.Millisecond}
+	fixtureCollectorMode(&co)
+	collector, e := plugin.StartCollector(context.Background(), listener, co)
 	if e != nil {
 		os.Exit(2)
 	}

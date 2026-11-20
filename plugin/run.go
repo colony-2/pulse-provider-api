@@ -64,15 +64,23 @@ func runSession(ctx context.Context, factory Factory, o RunOptions, healthyFor *
 	defer socket.Close()
 	stopStartup := context.AfterFunc(startup, func() { _ = socket.Close() })
 	defer stopStartup()
-	tc := tls.Client(socket, o.TLSConfig)
-	if e = tc.HandshakeContext(startup); e != nil {
-		terminal = terminalTLSError(e)
-		return terminal, safeError(ErrProtocol, startup.Err())
-	}
-	if tc.ConnectionState().NegotiatedProtocol != reverseALPN {
-		return true, ErrProtocol
+	var tc net.Conn = socket
+	if o.Transport == ReverseTransportTLS {
+		secured := tls.Client(socket, o.TLSConfig)
+		if e = secured.HandshakeContext(startup); e != nil {
+			return terminalTLSError(e), safeError(ErrProtocol, startup.Err())
+		}
+		if secured.ConnectionState().NegotiatedProtocol != reverseProtocol(o.AuthMode) {
+			return true, ErrProtocol
+		}
+		tc = secured
 	}
 	_ = tc.SetDeadline(deadlineOf(startup))
+	if o.AuthMode == ReverseAuthMutualKey {
+		if e = writeKeyRequest(tc, o.Init.Name, o.MutualKey); e != nil {
+			return false, safeError(ErrProtocol, startup.Err())
+		}
+	}
 	id, e := readAdmission(tc)
 	if e != nil {
 		return errors.Is(e, ErrProtocol) || terminalTLSError(e), safeError(ErrProtocol, startup.Err())

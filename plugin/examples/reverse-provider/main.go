@@ -2,11 +2,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -21,40 +24,103 @@ type config struct {
 }
 type provider struct{ base string }
 
-// Supply explicit certificate, key, CA and configuration files. This command
-// opens no listening socket; all SDK traffic uses its outgoing TLS connection.
+// The provider opens no listening socket. Credentials come only from the selected source.
 func main() {
-	address := flag.String("address", "", "collector host:port")
-	name := flag.String("name", "", "authorized provider ID")
-	serverName := flag.String("server-name", "", "verified collector DNS name")
-	ca := flag.String("ca", "", "trusted host CA file")
-	cert := flag.String("cert", "", "client certificate file")
-	key := flag.String("key", "", "client private key file")
-	configFile := flag.String("config", "", "local YAML file")
-	flag.Parse()
-	pair, e := tls.LoadX509KeyPair(*cert, *key)
-	if e != nil {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	// Own a pollable stdin pipe on Unix; unsupported inputs fail with guidance.
+	input := os.Stdin
+	if owned, e := os.Open("/dev/stdin"); e == nil {
+		input = owned
+		defer input.Close()
+	}
+	if e := runProvider(ctx, os.Args[1:], input); e != nil && !errors.Is(e, context.Canceled) {
+		fmt.Fprintln(os.Stderr, "reverse provider failed:", e)
 		os.Exit(1)
 	}
-	b, e := os.ReadFile(*ca)
-	if e != nil {
-		os.Exit(1)
+}
+func providerOptions(ctx context.Context, args []string, input *os.File) (plugin.RunOptions, error) {
+	var opts plugin.RunOptions
+	flags := flag.NewFlagSet("reverse-provider", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	address := flags.String("address", "", "collector host:port")
+	name := flags.String("name", "", "authorized provider ID")
+	serverName := flags.String("server-name", "", "verified collector DNS name")
+	ca := flags.String("ca", "", "trusted host CA file")
+	cert := flags.String("cert", "", "client certificate file")
+	key := flags.String("key", "", "client certificate private key file")
+	configFile := flags.String("config", "", "local YAML file")
+	auth := flags.String("auth", "mtls", "mtls or mutual-key")
+	transport := flags.String("transport", "tls", "tls or http (plaintext tests only)")
+	keyStdin := flags.Bool("auth-key-stdin", false, "read shared secret from first stdin line")
+	keyEnv := flags.String("auth-key-env", "", "environment variable containing shared secret")
+	if flags.Parse(args) != nil || flags.NArg() != 0 {
+		return opts, plugin.ErrInvalid
 	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(b) {
-		os.Exit(1)
+	a, t, e := plugin.ParseReverseModes(*auth, *transport)
+	if e != nil {
+		return opts, e
+	}
+	opts.AuthMode, opts.Transport = a, t
+	if a == plugin.ReverseAuthMutualKey {
+		if *keyStdin == (*keyEnv != "") {
+			return opts, plugin.ErrInvalid
+		}
+	} else if *keyStdin || *keyEnv != "" {
+		return opts, plugin.ErrInvalid
+	}
+	if t == plugin.ReverseTransportTLS {
+		b, e := os.ReadFile(*ca)
+		if e != nil {
+			return opts, plugin.ErrInvalid
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(b) {
+			return opts, plugin.ErrInvalid
+		}
+		opts.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{plugin.ReverseKeyALPN}, RootCAs: pool, ServerName: *serverName}
+		if a == plugin.ReverseAuthMTLS {
+			pair, e := tls.LoadX509KeyPair(*cert, *key)
+			if e != nil {
+				return opts, plugin.ErrInvalid
+			}
+			opts.TLSConfig.Certificates, opts.TLSConfig.NextProtos = []tls.Certificate{pair}, []string{plugin.ReverseALPN}
+		}
+	} else if *ca != "" || *cert != "" || *key != "" || *serverName != "" {
+		return opts, plugin.ErrInvalid
 	}
 	configuration, e := os.ReadFile(*configFile)
 	if e != nil {
-		os.Exit(1)
+		return opts, plugin.ErrInvalid
 	}
 	base, e := filepath.Abs(filepath.Dir(*configFile))
 	if e != nil {
-		os.Exit(1)
+		return opts, plugin.ErrInvalid
 	}
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-	err := plugin.Run(ctx, func(ctx context.Context, in plugin.Init) (api.Provider, plugin.Cleanup, error) {
+	opts.Address = *address
+	opts.Init = plugin.Initialization{Name: *name, BaseDir: base, ConfigYAML: configuration}
+	opts.Serve = plugin.ServeOptions{Implementation: "reverse-example", Version: "1.0.0"}
+	if a == plugin.ReverseAuthMutualKey {
+		if *keyStdin {
+			opts.MutualKey, e = plugin.LoadMutualKeyInput(ctx, input, bufio.NewReader(input))
+		} else {
+			opts.MutualKey, e = plugin.LoadMutualKey(plugin.MutualKeySource{EnvName: *keyEnv, LookupEnv: os.LookupEnv})
+		}
+		if e != nil {
+			return opts, e
+		}
+	}
+	return opts, nil
+}
+func runProvider(ctx context.Context, args []string, input *os.File) error {
+	opts, e := providerOptions(ctx, args, input)
+	if e != nil {
+		return e
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return plugin.Run(ctx, func(ctx context.Context, in plugin.Init) (api.Provider, plugin.Cleanup, error) {
 		var cfg config
 		if err := plugin.DecodeConfig(in.ConfigYAML, &cfg); err != nil {
 			return nil, nil, err
@@ -68,10 +134,7 @@ func main() {
 			return nil, nil, errors.New("base required")
 		}
 		return &provider{base: cfg.Base}, func(context.Context) error { return nil }, nil
-	}, plugin.RunOptions{Address: *address, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{plugin.ReverseALPN}, RootCAs: pool, ServerName: *serverName, Certificates: []tls.Certificate{pair}}, Init: plugin.Initialization{Name: *name, BaseDir: base, ConfigYAML: configuration}, Serve: plugin.ServeOptions{Implementation: "reverse-example", Version: "1.0.0"}})
-	if err != nil && !errors.Is(err, context.Canceled) {
-		os.Exit(1)
-	}
+	}, opts)
 }
 func (p *provider) GetCapabilities(context.Context) (api.Capabilities, error) {
 	return api.Capabilities{Bases: []api.BaseCapabilities{{Name: p.base, Capabilities: []string{}}}, BasesComplete: true}, nil
