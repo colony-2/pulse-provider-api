@@ -15,7 +15,7 @@ import (
 )
 
 // ReverseALPN distinguishes reverse provider sessions from ordinary gRPC.
-const ReverseALPN = "pulse-provider-reverse/1"
+const ReverseALPN = "pulse-provider-reverse/3"
 
 const reverseALPN = ReverseALPN
 
@@ -68,7 +68,7 @@ func reverseTLS(in *tls.Config, host bool) (*tls.Config, error) {
 
 func writeAdmission(c net.Conn, status byte, id string) error {
 	b := make([]byte, 7+len(id))
-	copy(b, "PPR1")
+	copy(b, "PPR3")
 	b[4] = status
 	binary.BigEndian.PutUint16(b[5:7], uint16(len(id)))
 	copy(b[7:], id)
@@ -90,7 +90,7 @@ func readAdmission(c net.Conn) (string, error) {
 		return "", e
 	}
 	n := int(binary.BigEndian.Uint16(h[5:]))
-	if string(h[:4]) != "PPR1" || h[4] > 4 || n > 256 {
+	if string(h[:4]) != "PPR3" || h[4] > 4 || n > 256 {
 		return "", ErrProtocol
 	}
 	if h[4] != 0 {

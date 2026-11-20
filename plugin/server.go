@@ -40,6 +40,11 @@ type server struct {
 	permits          chan struct{}
 	high             uint64
 	tokens           map[uint64]struct{}
+	logs             map[uint64]*logRegistration
+	logPool          *logPool
+	logRetired       map[uint64]struct{}
+	logHigh          uint64
+	logStreams       chan struct{}
 	// reverseInit is provider-local; hosts may supply only its bound identity.
 	reverseInit      *Initialization
 	terminal         chan error
@@ -101,7 +106,7 @@ func Serve(factory Factory, options ServeOptions) error {
 		gmu.Unlock()
 	}()
 	hp.Serve(&hp.ServeConfig{HandshakeConfig: handshake, Plugins: hp.PluginSet{"provider": &transportPlugin{server: s}}, Logger: hclog.NewNullLogger(), GRPCServer: func(opts []grpc.ServerOption) *grpc.Server {
-		opts = append(opts, grpc.MaxRecvMsgSize(options.MaxMessageBytes), grpc.MaxSendMsgSize(options.MaxMessageBytes), grpc.UnaryInterceptor(s.intercept))
+		opts = append(opts, grpc.MaxRecvMsgSize(options.MaxMessageBytes), grpc.MaxSendMsgSize(options.MaxMessageBytes), grpc.MaxConcurrentStreams(uint32(options.Concurrency+options.LogOptions.MaxSubscriptions+2)), grpc.UnaryInterceptor(s.intercept))
 		gmu.Lock()
 		defer gmu.Unlock()
 		gs = grpc.NewServer(opts...)
@@ -296,17 +301,34 @@ func (s *server) GetCapabilities(ctx context.Context, _ *wire.Empty) (*wire.Capa
 	return r, nil
 }
 func (s *server) Submit(ctx context.Context, r *wire.SubmitRequest) (*wire.SubmitResponse, error) {
+	if len(r.Launches) < 1 || len(r.Launches) > api.MaxBatch {
+		s.rejectLogRequest(r)
+		return nil, status.Error(codes.InvalidArgument, "launch")
+	}
 	ls := make([]api.Launch, len(r.Launches))
 	for i, l := range r.Launches {
 		v, e := fromLaunch(l)
 		if e != nil {
+			s.rejectLogRequest(r)
 			return nil, status.Error(codes.InvalidArgument, "launch")
 		}
 		ls[i] = v
 	}
 	if validateLaunches(ls) != nil {
+		s.rejectLogRequest(r)
 		return nil, status.Error(codes.InvalidArgument, "launch")
 	}
+	logOptions, registration, le := s.bindLogs(r, ls)
+	if le != nil {
+		s.rejectLogRequest(r)
+		return nil, status.Error(codes.InvalidArgument, "listener")
+	}
+	dispatched := false
+	defer func() {
+		if !dispatched && registration != nil {
+			registration.sub.notStarted()
+		}
+	}()
 	// Commit headers before entering native code, disabling transparent retry after
 	// dispatch. A sliding fence rejects duplicate and retired tokens without replay.
 	s.mu.Lock()
@@ -331,7 +353,13 @@ func (s *server) Submit(ctx context.Context, r *wire.SubmitRequest) (*wire.Submi
 	if e := grpc.SendHeader(ctx, metadata.MD{}); e != nil {
 		return nil, e
 	}
-	ss, e := s.provider.Submit(ctx, ls)
+	dispatched = true
+	ss, native, e := s.provider.Submit(ctx, ls, logOptions)
+	if r.Listen {
+		s.watchNative(registration, native)
+	} else if native != nil {
+		native.Stop()
+	}
 	out := &wire.SubmitResponse{Error: toError(e)}
 	for _, v := range ss {
 		out.Results = append(out.Results, toSub(v))

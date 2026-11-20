@@ -13,6 +13,7 @@ import (
 // CollectorOptions configures authenticated provider collection. Authorize maps
 // an ordinarily verified certificate to a configured, case-sensitive identity.
 type CollectorOptions struct {
+	LogOptions                                                        LogOptions
 	TLSConfig                                                         *tls.Config
 	Authorize                                                         func(context.Context, tls.ConnectionState) (string, error)
 	StartupTimeout, CallTimeout, ShutdownTimeout                      time.Duration
@@ -35,6 +36,9 @@ type RunOptions struct {
 }
 
 func (o *CollectorOptions) defaults() error {
+	if e := o.LogOptions.defaults(); e != nil {
+		return e
+	}
 	var e error
 	if o.Authorize == nil {
 		return ErrInvalid

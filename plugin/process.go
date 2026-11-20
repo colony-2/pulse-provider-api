@@ -94,6 +94,7 @@ func copyMap(in map[string]string) map[string]string {
 func (p *Process) Health() Health { p.mu.Lock(); defer p.mu.Unlock(); return p.health }
 func (p *Process) Close() error {
 	p.closeOnce.Do(func() {
+		p.logClosing.Store(true)
 		p.mu.Lock()
 		p.health.State = "closing"
 		p.closeDeadline = time.Now().Add(p.opts.ShutdownTimeout)

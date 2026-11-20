@@ -34,7 +34,7 @@ func TestReverseCallsFidelityAndMethodErrors(t *testing.T) {
 	}}
 	_, done := launchRun(t, factoryFor(p), runOptions(t, c, tr, "alpha"))
 	connection := nextSnapshot(t, c, 1).Providers[0].Provider.(*Connection)
-	out, obs, e := connection.SubmitDetailed(context.Background(), ls)
+	out, obs, _, e := connection.SubmitDetailed(context.Background(), ls, api.SubmitOptions{})
 	if e == nil || out[0].Status != api.Accepted || out[1].Status != api.NoCapacity || out[2].Status != api.Unknown || out[3].Status != api.Unknown || !reflect.DeepEqual(got, ls) || !obs.MethodError.Present || len(obs.Outcomes) != 5 || obs.Generation != connection.Health().Generation {
 		t.Fatal(out, obs, e)
 	}
@@ -76,7 +76,7 @@ func TestReverseDisconnectAfterDispatchIsUnknown(t *testing.T) {
 	}
 	returned := make(chan result, 1)
 	go func() {
-		ss, e := connection.Submit(context.Background(), launches("uncertain"))
+		ss, _, e := connection.Submit(context.Background(), launches("uncertain"), api.SubmitOptions{})
 		returned <- result{ss, e}
 	}()
 	<-entered
@@ -98,7 +98,7 @@ func TestReverseDisconnectAfterDispatchIsUnknown(t *testing.T) {
 	if v := callbackEvent(t, fresh); len(v.Joined) != 1 {
 		t.Fatal(v)
 	}
-	ss, e := connection.Submit(context.Background(), launches("uncertain"))
+	ss, _, e := connection.Submit(context.Background(), launches("uncertain"), api.SubmitOptions{})
 	if !errors.Is(e, ErrUnavailable) || ss[0].Status != api.Unavailable || p.calls.Load() != 1 {
 		t.Fatal(ss, e)
 	}
@@ -125,27 +125,30 @@ func TestReversePredispatchAndControlIsolation(t *testing.T) {
 	connection := nextSnapshot(t, c, 1).Providers[0].Provider.(*Connection)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	ss, e := connection.Submit(ctx, launches("cancel"))
+	ss, _, e := connection.Submit(ctx, launches("cancel"), api.SubmitOptions{})
 	if !errors.Is(e, context.Canceled) || ss[0].Status != api.Unavailable {
 		t.Fatal(ss, e)
 	}
 	invalid := launches("bad")
 	invalid[0].Lease = ""
-	if _, e = connection.Submit(context.Background(), invalid); e == nil {
+	if _, _, e = connection.Submit(context.Background(), invalid, api.SubmitOptions{}); e == nil {
 		t.Fatal("invalid allowed")
 	}
 	big := launches("big")
 	big[0].Lease = api.Lease(strings.Repeat("x", 3000))
-	if _, e = connection.Submit(context.Background(), big); !errors.Is(e, ErrTooLarge) {
+	if _, _, e = connection.Submit(context.Background(), big, api.SubmitOptions{}); !errors.Is(e, ErrTooLarge) {
 		t.Fatal(e)
 	}
 	if p.calls.Load() != 0 {
 		t.Fatal("predispatch handler entry")
 	}
 	first := make(chan error, 1)
-	go func() { _, e := connection.Submit(context.Background(), launches("one")); first <- e }()
+	go func() {
+		_, _, e := connection.Submit(context.Background(), launches("one"), api.SubmitOptions{})
+		first <- e
+	}()
 	<-entered
-	if _, e = connection.Submit(context.Background(), launches("two")); !errors.Is(e, ErrSaturated) {
+	if _, _, e = connection.Submit(context.Background(), launches("two"), api.SubmitOptions{}); !errors.Is(e, ErrSaturated) {
 		t.Fatal(e)
 	}
 	// Explicit control RPCs bypass the saturated business permit.
@@ -198,7 +201,7 @@ func TestReverseInvocationFenceAndObservations(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ss, obs, e := connection.SubmitDetailed(context.Background(), launches("parallel"))
+			ss, obs, _, e := connection.SubmitDetailed(context.Background(), launches("parallel"), api.SubmitOptions{})
 			if e != nil || ss[0].Status != api.Accepted || obs.Capture != "complete" || obs.Generation != connection.g.id {
 				t.Error(ss, obs, e)
 			}

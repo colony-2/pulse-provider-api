@@ -32,7 +32,7 @@ func TestReverseNativeWorkSurvivesSessionAndProviderLoss(t *testing.T) {
 			dir := t.TempDir()
 			cmd := reverseProcess(t, c.listener.Addr().String(), trust, dir, mode)
 			handle := nextSnapshot(t, c, 1).Providers[0].Provider
-			ss, e := handle.Submit(context.Background(), launches("reverse-native"))
+			ss, _, e := handle.Submit(context.Background(), launches("reverse-native"), api.SubmitOptions{})
 			if mode == "native" {
 				if e != nil || ss[0].Status != api.Accepted {
 					t.Fatal(ss, e)

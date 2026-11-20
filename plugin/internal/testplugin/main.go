@@ -45,6 +45,10 @@ func waitFile(ctx context.Context, path string) {
 	}
 }
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "log-work" {
+		logWork()
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "callback-hang" {
 		callbackHang()
 		return
@@ -59,6 +63,11 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "reverse-host" {
 		reverseHost()
+		return
+	}
+	if os.Getenv("MODE") == "v2" {
+		fmt.Println("1|2|unix|/nonexistent|grpc|")
+		time.Sleep(time.Minute)
 		return
 	}
 	if os.Getenv("MODE") == "v1" {
@@ -80,13 +89,25 @@ func main() {
 		if in.Name != "fixture" || in.BaseDir != dir || string(in.ConfigYAML) != "mode: fixture\n" || in.ExecutorEnv["EXECUTOR_ONLY"] != "executor-default" {
 			return nil, nil, errors.New("init mismatch")
 		}
-		go func() { <-in.Lifetime.Done(); appendEvent(dir, "maintenance_canceled") }()
+		maintenanceDone := make(chan struct{})
+		go func() {
+			defer close(maintenanceDone)
+			<-in.Lifetime.Done()
+			appendEvent(dir, "maintenance_canceled")
+		}()
 		cleanup := func(ctx context.Context) error {
 			appendEvent(dir, "cleanup")
 			if mode == "hungcleanup" {
 				select {}
 			}
-			return nil
+			// Join fixture maintenance before Run/Serve returns and main exits;
+			// cancellation alone does not schedule its final evidence write.
+			select {
+			case <-maintenanceDone:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 		if mode == "hungfactory" {
 			select {}
@@ -190,7 +211,7 @@ func (f *fixture) List(ctx context.Context, r api.ListRequest) (api.ListResponse
 	}
 	return v, nil
 }
-func (f *fixture) Submit(ctx context.Context, ls []api.Launch) ([]api.Submission, error) {
+func (f *fixture) submitAdmission(ctx context.Context, ls []api.Launch) ([]api.Submission, error) {
 	for _, l := range ls {
 		appendEvent(f.dir, "submit "+l.LaunchID)
 	}
@@ -282,12 +303,14 @@ func host() {
 	exe, _ := os.Executable()
 	p, e := plugin.Start(context.Background(), plugin.StartOptions{Executable: exe, Env: map[string]string{"EVENT_DIR": dir, "MODE": hostMode()}, Init: plugin.Initialization{Name: "fixture", BaseDir: dir, ConfigYAML: []byte("mode: fixture\n"), ExecutorEnv: map[string]string{"EXECUTOR_ONLY": "executor-default"}}, ShutdownTimeout: 500 * time.Millisecond})
 	if e != nil {
+		fmt.Fprintln(os.Stderr, "fixture host: provider start failed:", e)
 		os.Exit(2)
 	}
 	defer p.Close()
 	t := time.Date(9999, 1, 1, 0, 0, 0, 123, time.UTC)
-	_, e = p.Submit(context.Background(), []api.Launch{{LaunchID: "host-loss", Allocation: api.Allocation{Base: "ubuntu[ab]*/arm*", CPUMillis: api.MaxQuantity}, Lease: api.Lease("\xffexact-lease"), Job: api.JobRef{JobDB: "https://db/tenant", InstanceID: "db", TenantID: "tenant", JobID: "job"}, TimeoutSeconds: 2, StartBefore: &t}})
+	_, _, e = p.Submit(context.Background(), []api.Launch{{LaunchID: "host-loss", Allocation: api.Allocation{Base: "ubuntu[ab]*/arm*", CPUMillis: api.MaxQuantity}, Lease: api.Lease("\xffexact-lease"), Job: api.JobRef{JobDB: "https://db/tenant", InstanceID: "db", TenantID: "tenant", JobID: "job"}, TimeoutSeconds: 2, StartBefore: &t}}, api.SubmitOptions{})
 	if e != nil {
+		fmt.Fprintln(os.Stderr, "fixture host: submission failed:", e)
 		os.Exit(3)
 	}
 	_ = os.WriteFile(filepath.Join(dir, "host-ready"), []byte("ready"), 0600)
@@ -350,10 +373,18 @@ func reverseHost() {
 		os.Exit(3)
 	}
 	deadline := time.Date(9999, 1, 1, 0, 0, 0, 123, time.UTC)
-	_, e = snapshot.Providers[0].Provider.Submit(ctx, []api.Launch{{LaunchID: "host-loss", Allocation: api.Allocation{Base: "ubuntu[ab]*/arm*", CPUMillis: api.MaxQuantity}, Lease: api.Lease("\xffexact-lease"), Job: api.JobRef{JobDB: "https://db/tenant", InstanceID: "db", TenantID: "tenant", JobID: "job"}, TimeoutSeconds: 2, StartBefore: &deadline}})
+	_, _, e = snapshot.Providers[0].Provider.Submit(ctx, []api.Launch{{LaunchID: "host-loss", Allocation: api.Allocation{Base: "ubuntu[ab]*/arm*", CPUMillis: api.MaxQuantity}, Lease: api.Lease("\xffexact-lease"), Job: api.JobRef{JobDB: "https://db/tenant", InstanceID: "db", TenantID: "tenant", JobID: "job"}, TimeoutSeconds: 2, StartBefore: &deadline}}, api.SubmitOptions{})
 	if e != nil {
 		os.Exit(4)
 	}
 	_ = os.WriteFile(filepath.Join(dir, "host-ready"), []byte("ready"), 0600)
 	select {}
+}
+
+func (f *fixture) Submit(ctx context.Context, ls []api.Launch, options api.SubmitOptions) ([]api.Submission, api.LogSubscription, error) {
+	if strings.HasPrefix(f.mode, "logs") {
+		return f.submitLogs(ctx, ls, options)
+	}
+	results, e := f.submitAdmission(ctx, ls)
+	return results, nil, e
 }

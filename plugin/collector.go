@@ -35,6 +35,7 @@ type ProviderCollector interface {
 // scheduling, admission policy, and accepted native work belong to the host/provider.
 type Collector struct {
 	opts                 CollectorOptions
+	logs                 *logPool
 	listener             net.Listener
 	ctx                  context.Context
 	cancel               context.CancelFunc
@@ -223,7 +224,7 @@ func (c *Collector) admit(socket *sessionSocket) {
 	// Retirement owns generation cancellation, so a parent cancellation cannot
 	// remove a peer before collector shutdown captures it for disposal.
 	g.ctx, g.cancel = context.WithCancel(context.Background())
-	p := &Connection{sessionCaller: sessionCaller{opts: StartOptions{CallTimeout: c.opts.CallTimeout}, permits: make(chan struct{}, c.opts.Concurrency), ctx: g.ctx, cancel: g.cancel}, collector: c, id: id, g: g, socket: socket, done: make(chan struct{})}
+	p := &Connection{sessionCaller: sessionCaller{opts: StartOptions{CallTimeout: c.opts.CallTimeout, LogOptions: c.opts.LogOptions}, sharedLogs: c.logsPool, permits: make(chan struct{}, c.opts.Concurrency), ctx: g.ctx, cancel: g.cancel}, collector: c, id: id, g: g, socket: socket, done: make(chan struct{})}
 	c.reserved[id] = p
 	c.mu.Unlock()
 	success := false
@@ -283,6 +284,7 @@ func (c *Collector) stop(cause error) {
 		left := c.snapshotLocked().Providers
 		peers := make([]*Connection, 0, len(c.reserved))
 		for _, p := range c.reserved {
+			p.logClosing.Store(true)
 			p.invalidate()
 		}
 		for _, p := range c.ready {
@@ -382,3 +384,13 @@ func (c *Collector) stop(cause error) {
 // Close shares one bounded completion among all callers.
 func (c *Collector) Close() error { c.stop(nil); return c.Wait() }
 func (c *Collector) Wait() error  { <-c.done; c.mu.Lock(); defer c.mu.Unlock(); return c.result }
+
+// The pool belongs to the collector, so reconnects cannot replace stuck workers.
+func (c *Collector) logsPool() *logPool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.logs == nil {
+		c.logs = newLogPool(c.opts.LogOptions)
+	}
+	return c.logs
+}

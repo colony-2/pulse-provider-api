@@ -80,7 +80,7 @@ func TestCollectorMembershipAndGenerations(t *testing.T) {
 	if s.Providers[0].Generation <= old.Generation {
 		t.Fatal(s)
 	}
-	ss, e := old.Provider.Submit(context.Background(), launches("old"))
+	ss, _, e := old.Provider.Submit(context.Background(), launches("old"), api.SubmitOptions{})
 	if !errors.Is(e, ErrUnavailable) || ss[0].Status != api.Unavailable {
 		t.Fatal(ss, e)
 	}

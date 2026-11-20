@@ -39,7 +39,7 @@ func TestReversePostdispatchUncertainty(t *testing.T) {
 			completed := make(chan struct{})
 			var ss []api.Submission
 			var e error
-			go func() { ss, e = handle.Submit(ctx, launches("uncertain")); close(completed) }()
+			go func() { ss, _, e = handle.Submit(ctx, launches("uncertain"), api.SubmitOptions{}); close(completed) }()
 			<-entered
 			if fault == "cancel" {
 				cancel()
@@ -73,7 +73,7 @@ func TestReverseMetadataAndObservationBounds(t *testing.T) {
 	_, done := launchRun(t, factoryFor(p), runOptions(t, c, tr, "alpha"))
 	handle := nextSnapshot(t, c, 1).Providers[0].Provider.(*Connection)
 	// Ordinary method data stay complete; diagnostic observations remain bounded.
-	ss, obs, e := handle.SubmitDetailed(context.Background(), launches("bounds"))
+	ss, obs, _, e := handle.SubmitDetailed(context.Background(), launches("bounds"), api.SubmitOptions{})
 	if e == nil || len(ss[0].Reason) != 100000 || obs.Capture != "truncated" || len(obs.MethodError.Text) > MaxObservationBytes {
 		t.Fatal(len(ss[0].Reason), obs.Capture, e)
 	}

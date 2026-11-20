@@ -19,12 +19,13 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Provider_Negotiate_FullMethodName       = "/pulse.provider.plugin.v2.Provider/Negotiate"
-	Provider_Initialize_FullMethodName      = "/pulse.provider.plugin.v2.Provider/Initialize"
-	Provider_Control_FullMethodName         = "/pulse.provider.plugin.v2.Provider/Control"
-	Provider_GetCapabilities_FullMethodName = "/pulse.provider.plugin.v2.Provider/GetCapabilities"
-	Provider_Submit_FullMethodName          = "/pulse.provider.plugin.v2.Provider/Submit"
-	Provider_List_FullMethodName            = "/pulse.provider.plugin.v2.Provider/List"
+	Provider_Negotiate_FullMethodName       = "/pulse.provider.plugin.v3.Provider/Negotiate"
+	Provider_Initialize_FullMethodName      = "/pulse.provider.plugin.v3.Provider/Initialize"
+	Provider_Control_FullMethodName         = "/pulse.provider.plugin.v3.Provider/Control"
+	Provider_GetCapabilities_FullMethodName = "/pulse.provider.plugin.v3.Provider/GetCapabilities"
+	Provider_Submit_FullMethodName          = "/pulse.provider.plugin.v3.Provider/Submit"
+	Provider_Observe_FullMethodName         = "/pulse.provider.plugin.v3.Provider/Observe"
+	Provider_List_FullMethodName            = "/pulse.provider.plugin.v3.Provider/List"
 )
 
 // ProviderClient is the client API for Provider service.
@@ -36,6 +37,7 @@ type ProviderClient interface {
 	Control(ctx context.Context, in *ControlRequest, opts ...grpc.CallOption) (*Empty, error)
 	GetCapabilities(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*CapabilitiesResponse, error)
 	Submit(ctx context.Context, in *SubmitRequest, opts ...grpc.CallOption) (*SubmitResponse, error)
+	Observe(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ObserveControl, ObserveEvent], error)
 	List(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListResponse, error)
 }
 
@@ -97,6 +99,19 @@ func (c *providerClient) Submit(ctx context.Context, in *SubmitRequest, opts ...
 	return out, nil
 }
 
+func (c *providerClient) Observe(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ObserveControl, ObserveEvent], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Provider_ServiceDesc.Streams[0], Provider_Observe_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ObserveControl, ObserveEvent]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Provider_ObserveClient = grpc.BidiStreamingClient[ObserveControl, ObserveEvent]
+
 func (c *providerClient) List(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListResponse)
@@ -116,6 +131,7 @@ type ProviderServer interface {
 	Control(context.Context, *ControlRequest) (*Empty, error)
 	GetCapabilities(context.Context, *Empty) (*CapabilitiesResponse, error)
 	Submit(context.Context, *SubmitRequest) (*SubmitResponse, error)
+	Observe(grpc.BidiStreamingServer[ObserveControl, ObserveEvent]) error
 	List(context.Context, *ListRequest) (*ListResponse, error)
 	mustEmbedUnimplementedProviderServer()
 }
@@ -141,6 +157,9 @@ func (UnimplementedProviderServer) GetCapabilities(context.Context, *Empty) (*Ca
 }
 func (UnimplementedProviderServer) Submit(context.Context, *SubmitRequest) (*SubmitResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Submit not implemented")
+}
+func (UnimplementedProviderServer) Observe(grpc.BidiStreamingServer[ObserveControl, ObserveEvent]) error {
+	return status.Errorf(codes.Unimplemented, "method Observe not implemented")
 }
 func (UnimplementedProviderServer) List(context.Context, *ListRequest) (*ListResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method List not implemented")
@@ -256,6 +275,13 @@ func _Provider_Submit_Handler(srv interface{}, ctx context.Context, dec func(int
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Provider_Observe_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(ProviderServer).Observe(&grpc.GenericServerStream[ObserveControl, ObserveEvent]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Provider_ObserveServer = grpc.BidiStreamingServer[ObserveControl, ObserveEvent]
+
 func _Provider_List_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListRequest)
 	if err := dec(in); err != nil {
@@ -278,7 +304,7 @@ func _Provider_List_Handler(srv interface{}, ctx context.Context, dec func(inter
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
 var Provider_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "pulse.provider.plugin.v2.Provider",
+	ServiceName: "pulse.provider.plugin.v3.Provider",
 	HandlerType: (*ProviderServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
@@ -306,6 +332,13 @@ var Provider_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Provider_List_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "Observe",
+			Handler:       _Provider_Observe_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+	},
 	Metadata: "internal/wire/plugin.proto",
 }

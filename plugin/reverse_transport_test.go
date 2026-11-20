@@ -48,7 +48,7 @@ func TestReverseAdmissionPrefixes(t *testing.T) {
 			var constructs atomic.Int32
 			address := reversePeer(t, tr, func(tc *tls.Conn) {
 				h := make([]byte, 7)
-				copy(h, "PPR1")
+				copy(h, "PPR3")
 				switch kind {
 				case "denied":
 					h[4] = 1
@@ -149,7 +149,7 @@ func TestReverseAdmissionStatusBoundaries(t *testing.T) {
 			if kind == "generation_exhausted" {
 				want = 4
 			}
-			if string(h[:4]) != "PPR1" || h[4] != want || binary.BigEndian.Uint16(h[5:]) != 0 {
+			if string(h[:4]) != "PPR3" || h[4] != want || binary.BigEndian.Uint16(h[5:]) != 0 {
 				t.Fatal(h)
 			}
 			if kind == "generation_exhausted" && !errors.Is(c.Wait(), ErrUnavailable) {
@@ -214,7 +214,7 @@ func TestReverseOneConnectionCarriesGRPCAndCallbacks(t *testing.T) {
 	if _, e = p.List(context.Background(), api.ListRequest{}); e != nil {
 		t.Fatal(e)
 	}
-	if ss, e := p.Submit(context.Background(), launches("one-connection")); e != nil || ss[0].Status != api.Accepted {
+	if ss, _, e := p.Submit(context.Background(), launches("one-connection"), api.SubmitOptions{}); e != nil || ss[0].Status != api.Accepted {
 		t.Fatal(ss, e)
 	}
 	if v := callbackEvent(t, log); len(v.Joined) != 1 || l.accepts.Load() != 1 {
@@ -287,7 +287,7 @@ func TestReversePendingLimitsAndAuthorizationTimeout(t *testing.T) {
 	eventually(t, func() bool { return len(c.pending) == 0 })
 }
 func TestReverseInitializationOverridesAndNegotiation(t *testing.T) {
-	for _, kind := range []string{"config", "base", "env", "name", "semantics"} {
+	for _, kind := range []string{"config", "base", "env", "name", "semantics", "protocol"} {
 		t.Run(kind, func(t *testing.T) {
 			tr := testTrust(t)
 			var constructed atomic.Int32
@@ -309,8 +309,12 @@ func TestReverseInitializationOverridesAndNegotiation(t *testing.T) {
 				if kind == "semantics" {
 					required = []string{"wrong"}
 				}
-				_, e = rpc.Negotiate(ctx, &wire.Negotiation{Protocol: Protocol, Required: required, MaxMessageBytes: DefaultMessageBytes, ShutdownNanos: int64(time.Second)})
-				if kind == "semantics" {
+				baseline := uint32(Protocol)
+				if kind == "protocol" {
+					baseline = 2
+				}
+				_, e = rpc.Negotiate(ctx, &wire.Negotiation{Protocol: baseline, Required: required, MaxMessageBytes: DefaultMessageBytes, ShutdownNanos: int64(time.Second)})
+				if kind == "semantics" || kind == "protocol" {
 					if e == nil {
 						t.Error("negotiation succeeded")
 					}

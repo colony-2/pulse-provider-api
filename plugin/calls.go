@@ -16,13 +16,16 @@ import (
 // sessionCaller holds the transport-independent call safeguards. A Process may
 // replace its current generation; a Connection permanently owns just one.
 type sessionCaller struct {
-	opts     StartOptions
-	mu       sync.Mutex
-	current  *generation
-	ctx      context.Context
-	cancel   context.CancelFunc
-	permits  chan struct{}
-	sequence atomic.Uint64
+	opts       StartOptions
+	mu         sync.Mutex
+	current    *generation
+	ctx        context.Context
+	cancel     context.CancelFunc
+	permits    chan struct{}
+	sequence   atomic.Uint64
+	logClosing atomic.Bool
+	logs       *logPool
+	sharedLogs func() *logPool
 }
 
 func (p *sessionCaller) acquire(ctx context.Context) (*generation, context.Context, func(), error) {
@@ -102,38 +105,57 @@ func (p *sessionCaller) List(ctx context.Context, q api.ListRequest) (api.ListRe
 	}
 	return v, fromError(r.Error)
 }
-func (p *sessionCaller) Submit(ctx context.Context, ls []api.Launch) ([]api.Submission, error) {
-	r, _, e := p.SubmitDetailed(ctx, ls)
-	return r, e
+func (p *sessionCaller) Submit(ctx context.Context, ls []api.Launch, options api.SubmitOptions) ([]api.Submission, api.LogSubscription, error) {
+	r, _, sub, e := p.SubmitDetailed(ctx, ls, options)
+	return r, sub, e
 }
-func (p *sessionCaller) SubmitDetailed(ctx context.Context, ls []api.Launch) ([]api.Submission, SubmissionObservations, error) {
+func (p *sessionCaller) SubmitDetailed(ctx context.Context, ls []api.Launch, options api.SubmitOptions) ([]api.Submission, SubmissionObservations, api.LogSubscription, error) {
 	id := p.sequence.Add(1)
 	o := SubmissionObservations{Invocation: id, Capture: "not_captured"}
 	if e := validateLaunches(ls); e != nil {
-		return nonStart(ls, api.Rejected, e), o, e
+		return nonStart(ls, api.Rejected, e), o, nil, e
+	}
+	if e := validateListener(options); e != nil {
+		return nonStart(ls, api.Rejected, e), o, nil, e
 	}
 	req := &wire.SubmitRequest{Invocation: id}
 	for _, l := range ls {
 		v, e := toLaunch(l)
 		if e != nil {
-			return nonStart(ls, api.Rejected, e), o, e
+			return nonStart(ls, api.Rejected, e), o, nil, e
 		}
 		req.Launches = append(req.Launches, v)
 	}
+	var sub *logSubscription
+	var handle api.LogSubscription
+	if options.Listener != nil {
+		pool, limits := p.logsPool()
+		sub = newLogSubscription(limits, pool, ls, *options.Listener)
+		handle = sub
+	}
+	notStarted := func() {
+		if sub != nil {
+			sub.notStarted()
+		}
+	}
 	g, c, release, e := p.acquire(ctx)
 	if e != nil {
-		return nonStart(ls, api.Unavailable, safeError(ErrUnavailable, e)), o, e
+		notStarted()
+		return nonStart(ls, api.Unavailable, safeError(ErrUnavailable, e)), o, handle, e
 	}
 	defer release()
 	o.Generation = g.id
-	if e = p.beforeDispatch(c, g, req); e != nil {
-		return nonStart(ls, api.Unavailable, safeError(ErrUnavailable, e)), o, e
+	if sub != nil {
+		p.armLogs(c, g, req, sub, ls)
 	}
-	// This is the possible-dispatch boundary. Transport failure can never prove
-	// non-start. Never resend this call on this or a replacement generation.
+	if e = p.beforeDispatch(c, g, req); e != nil {
+		notStarted()
+		return nonStart(ls, api.Unavailable, safeError(ErrUnavailable, e)), o, handle, e
+	}
+	// The sole possible-dispatch boundary. Logging never causes a retry.
 	r, e := g.rpc.Submit(c, req, callOptions(g)...)
 	if e != nil {
-		return nonStart(ls, api.Unknown, ErrTransport), o, callError(c, e)
+		return nonStart(ls, api.Unknown, ErrTransport), o, handle, callError(c, e)
 	}
 	ss := make([]api.Submission, len(r.Results))
 	for i, s := range r.Results {
@@ -141,7 +163,7 @@ func (p *sessionCaller) SubmitDetailed(ctx context.Context, ls []api.Launch) ([]
 	}
 	o = observations(id, g.id, ss, r.Error)
 	out, bad := normalize(ls, ss)
-	return out, o, malformedError(bad, fromError(r.Error))
+	return out, o, handle, malformedError(bad, fromError(r.Error))
 }
 func callError(ctx context.Context, e error) error {
 	if ctx.Err() != nil {

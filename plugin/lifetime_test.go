@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -44,7 +45,7 @@ func TestAcceptedNativeWorkSurvivesAndExpires(t *testing.T) {
 			done := make(chan struct{})
 			var r []api.Submission
 			var e error
-			go func() { defer close(done); r, e = p.Submit(ctx, launches("native-work")) }()
+			go func() { defer close(done); r, _, e = p.Submit(ctx, launches("native-work"), api.SubmitOptions{}) }()
 			waitEvent(t, o.Init.BaseDir, "accepted native-work")
 			switch mode {
 			case "nativecancel":
@@ -80,21 +81,31 @@ func TestAbruptHostLossCancelsMaintenanceSparesNativeWork(t *testing.T) {
 	dir := t.TempDir()
 	host := exec.Command(fixtureBinary, "host", dir)
 	host.Env = []string{}
-	if out, e := host.StderrPipe(); e == nil {
-		_ = out
-	}
+	var diagnostics bytes.Buffer
+	host.Stderr = &diagnostics
 	if e := host.Start(); e != nil {
 		t.Fatal(e)
 	}
-	t.Cleanup(func() { _ = host.Process.Kill() })
-	eventually(t, func() bool { _, e := os.Stat(filepath.Join(dir, "host-ready")); return e == nil })
+	hostDone := make(chan struct{})
+	var hostErr error
+	go func() { hostErr = host.Wait(); close(hostDone) }()
+	t.Cleanup(func() { _ = host.Process.Kill(); <-hostDone })
+	eventually(t, func() bool {
+		select {
+		case <-hostDone:
+			t.Fatalf("host exited before readiness: %v; stderr: %s; events: %s", hostErr, diagnostics.String(), events(dir))
+		default:
+		}
+		_, e := os.Stat(filepath.Join(dir, "host-ready"))
+		return e == nil
+	})
 	pluginPID := readPID(t, dir, "pid")
 	tmp, e := os.ReadFile(filepath.Join(dir, "tmpdir"))
 	if e != nil {
 		t.Fatal(e)
 	}
 	_ = host.Process.Kill()
-	_ = host.Wait()
+	<-hostDone
 	waitEvent(t, dir, "maintenance_canceled")
 	eventually(t, func() bool { reapAdopted(pluginPID); return errors.Is(syscall.Kill(pluginPID, 0), syscall.ESRCH) })
 	verifyNativeCap(t, dir)

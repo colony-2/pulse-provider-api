@@ -164,10 +164,11 @@ func receiveRun(t *testing.T, done <-chan error) error {
 }
 
 type reverseProvider struct {
-	caps   func(context.Context) (api.Capabilities, error)
-	submit func(context.Context, []api.Launch) ([]api.Submission, error)
-	list   func(context.Context, api.ListRequest) (api.ListResponse, error)
-	calls  atomic.Int32
+	caps           func(context.Context) (api.Capabilities, error)
+	submitWithLogs func(context.Context, []api.Launch, api.SubmitOptions) ([]api.Submission, api.LogSubscription, error)
+	submit         func(context.Context, []api.Launch) ([]api.Submission, error)
+	list           func(context.Context, api.ListRequest) (api.ListResponse, error)
+	calls          atomic.Int32
 }
 
 func (p *reverseProvider) GetCapabilities(ctx context.Context) (api.Capabilities, error) {
@@ -176,16 +177,20 @@ func (p *reverseProvider) GetCapabilities(ctx context.Context) (api.Capabilities
 	}
 	return api.Capabilities{BasesComplete: true, Bases: []api.BaseCapabilities{{Name: "test"}}}, nil
 }
-func (p *reverseProvider) Submit(ctx context.Context, ls []api.Launch) ([]api.Submission, error) {
+func (p *reverseProvider) Submit(ctx context.Context, ls []api.Launch, options api.SubmitOptions) ([]api.Submission, api.LogSubscription, error) {
 	p.calls.Add(1)
+	if p.submitWithLogs != nil {
+		return p.submitWithLogs(ctx, ls, options)
+	}
 	if p.submit != nil {
-		return p.submit(ctx, ls)
+		r, e := p.submit(ctx, ls)
+		return r, nil, e
 	}
 	out := make([]api.Submission, len(ls))
 	for i, l := range ls {
 		out[i] = api.Submission{LaunchID: l.LaunchID, Status: api.Accepted}
 	}
-	return out, nil
+	return out, nil, nil
 }
 func (p *reverseProvider) List(ctx context.Context, q api.ListRequest) (api.ListResponse, error) {
 	if p.list != nil {

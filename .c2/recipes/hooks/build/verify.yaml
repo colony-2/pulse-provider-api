@@ -1,6 +1,6 @@
 schema_version: 2
 id: provider-plugin-verify
-version: 0.3.0
+version: 0.4.1
 inputs:
   api_version: ${{ inputs.api_version }}
   base: ${{ inputs.base }}
@@ -34,7 +34,7 @@ input_schema:
 outputs:
   api_version: c2.build-hook/v1
   status: '${{ sequence.checks.outputs.exit_code == 0 ? "passed" : "failed" }}'
-  summary: '${{ sequence.checks.outputs.exit_code == 0 ? "Root and plugin tests, ordered collector callbacks and worker bounds, reverse network acceptance, vet, race, independent consumers, tidiness and reproducible generation passed." : "Required provider/plugin acceptance failed; inspect error/plugin-checks.log." }}'
+  summary: '${{ sequence.checks.outputs.exit_code == 0 ? "Both candidate modules, partial coverage metadata bounds, remote listener capacity categories, admission independence, both log transports, callback bounds, collector regressions, Go 1.22 consumers, vet, race, tidiness and reproducible generation passed." : "Required provider/plugin acceptance failed; inspect error/plugin-checks.log." }}'
   artifact_refs:
     error/plugin-checks.log: ${{ sequence.checks.artifacts['error/plugin-checks.log'] }}
 sequence:

@@ -1,5 +1,8 @@
-.PHONY: check generate release-check
+.PHONY: check check-modules generate release-check
 check:
+	scripts/check-candidate.sh
+
+check-modules:
 	GOWORK=off go test ./...
 	GOWORK=off go vet ./...
 	GOWORK=off go test -race ./...

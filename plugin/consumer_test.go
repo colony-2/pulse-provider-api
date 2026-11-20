@@ -40,6 +40,7 @@ require (
 		t.Fatal(e)
 	}
 	command(t, dir, []string{"GOTOOLCHAIN=go1.22.12"}, "go", "mod", "edit", "-replace=github.com/colony-2/pulse-provider-api/plugin="+root)
+	command(t, dir, []string{"GOTOOLCHAIN=go1.22.12"}, "go", "mod", "edit", "-replace=github.com/colony-2/pulse-provider-api="+filepath.Dir(root))
 	for _, name := range []string{"provider", "host", "reverse-host", "reverse-provider"} {
 		source, e := os.ReadFile(filepath.Join("examples", name, "main.go"))
 		if e != nil {
@@ -74,16 +75,47 @@ require (
 	t.Log(output)
 	command(t, dir, []string{"GOTOOLCHAIN=go1.22.12"}, "go", "build", "-o", filepath.Join(dir, "host-bin"), "./host")
 	output = command(t, dir, []string{"GOTOOLCHAIN=go1.22.12"}, filepath.Join(dir, "host-bin"), filepath.Join(dir, "provider-bin"))
-	if !strings.Contains(output, "ready protocol=2 bases=1") {
+	if !strings.Contains(output, "ready protocol=3 bases=1") {
 		t.Fatal(output)
 	}
+	// Compile the detached fixture and an independent listener against BOTH local
+	// candidate modules, then exercise process and authenticated network delivery.
+	fixtureDir := filepath.Join(dir, "fixture")
+	if e = os.Mkdir(fixtureDir, 0700); e != nil {
+		t.Fatal(e)
+	}
+	for _, name := range []string{"main.go", "logs.go"} {
+		b, e := os.ReadFile(filepath.Join("internal", "testplugin", name))
+		if e != nil {
+			t.Fatal(e)
+		}
+		if e = os.WriteFile(filepath.Join(fixtureDir, name), b, 0600); e != nil {
+			t.Fatal(e)
+		}
+	}
+	command(t, dir, []string{"GOTOOLCHAIN=go1.22.12"}, "go", "build", "-o", filepath.Join(dir, "fixture-bin"), "./fixture")
+	listenerDir := filepath.Join(dir, "listener")
+	if e = os.Mkdir(listenerDir, 0700); e != nil {
+		t.Fatal(e)
+	}
+	source, e := os.ReadFile(filepath.Join("testdata", "listener_consumer_test.go"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = os.WriteFile(filepath.Join(listenerDir, "listener_test.go"), source, 0600); e != nil {
+		t.Fatal(e)
+	}
+	trust := testTrust(t, "fixture").files(t)
+	t.Log(command(t, dir, []string{"GOTOOLCHAIN=go1.22.12", "LOG_FIXTURE=" + filepath.Join(dir, "fixture-bin"), "LOG_TRUST=" + trust}, "go", "test", "-v", "./listener"))
+	t.Log(command(t, dir, []string{"GOTOOLCHAIN=go1.22.12"}, "go", "list", "-m", "-json", "github.com/colony-2/pulse-provider-api", "github.com/colony-2/pulse-provider-api/plugin"))
+
 	deps := command(t, dir, []string{"GOTOOLCHAIN=go1.22.12"}, "go", "list", "-deps", "./...")
 	for _, forbidden := range []string{"github.com/colony-2/pulse/", "github.com/colony-2/c2j/", "jobdb"} {
 		if strings.Contains(deps, forbidden) {
 			t.Fatal("unexpected dependency", forbidden)
 		}
 	}
-	t.Log("independent copied author and host build and run: ready protocol=2 bases=1; temporary candidate replacement only")
+	t.Log("independent copied author and host build and run: ready protocol=3 bases=1; temporary candidate replacement only")
 }
 func TestAPIOnlyGo122Consumer(t *testing.T) {
 	dir := t.TempDir()
@@ -94,6 +126,11 @@ func TestAPIOnlyGo122Consumer(t *testing.T) {
 		t.Fatal(e)
 	}
 	env := []string{"GOTOOLCHAIN=go1.22.12"}
+	root, e := os.Getwd()
+	if e != nil {
+		t.Fatal(e)
+	}
+	command(t, dir, env, "go", "mod", "edit", "-replace=github.com/colony-2/pulse-provider-api="+filepath.Dir(root))
 	command(t, dir, env, "go", "mod", "tidy")
 	command(t, dir, env, "go", "test", "./...")
 	modules := command(t, dir, env, "go", "list", "-m", "all")
@@ -104,5 +141,5 @@ func TestAPIOnlyGo122Consumer(t *testing.T) {
 	if strings.TrimSpace(deps) != "github.com/colony-2/pulse-provider-api" {
 		t.Fatal(deps)
 	}
-	t.Log("published root API compiled under Go 1.22.12; no nonstandard dependency except the API module")
+	t.Log("candidate root API compiled under Go 1.22.12; no nonstandard dependency except the API module")
 }

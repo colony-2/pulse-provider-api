@@ -1,5 +1,5 @@
 // Package plugin serves and hosts out-of-process providers over authenticated
-// baseline-2 gRPC. It has no dependency on Pulse controller or configuration code.
+// baseline-3 gRPC. It has no dependency on Pulse controller or configuration code.
 // Accepted native work and its runtime enforcement remain provider responsibilities.
 package plugin
 
@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	Protocol              = 2
+	Protocol              = 3
 	DefaultMessageBytes   = 16 << 20
 	MaxMessageBytes       = 128 << 20
 	MaxConfigBytes        = 1 << 20
@@ -57,6 +57,7 @@ type Cleanup func(context.Context) error
 type Factory func(context.Context, Init) (provider.Provider, Cleanup, error)
 
 type ServeOptions struct {
+	LogOptions      LogOptions
 	Implementation  string
 	Version         string
 	MaxMessageBytes int
@@ -75,6 +76,7 @@ type RestartPolicy struct {
 }
 
 type StartOptions struct {
+	LogOptions LogOptions
 	Executable string
 	Args       []string
 	// Env is the complete selected child environment, not additions to os.Environ.
@@ -150,6 +152,9 @@ func limits(m, c *int) error {
 	return nil
 }
 func (o *ServeOptions) defaults() error {
+	if e := o.LogOptions.defaults(); e != nil {
+		return e
+	}
 	if err := limits(&o.MaxMessageBytes, &o.Concurrency); err != nil {
 		return err
 	}
@@ -159,6 +164,9 @@ func (o *ServeOptions) defaults() error {
 	return duration(&o.ShutdownTimeout, 5*time.Second)
 }
 func (o *StartOptions) defaults() error {
+	if e := o.LogOptions.defaults(); e != nil {
+		return e
+	}
 	if !filepath.IsAbs(o.Executable) || o.Init.Name == "" || !filepath.IsAbs(o.Init.BaseDir) || len(o.Init.ConfigYAML) > MaxConfigBytes {
 		return ErrInvalid
 	}

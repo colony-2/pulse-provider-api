@@ -128,12 +128,12 @@ func TestProcessReadyInitializationAndClose(t *testing.T) {
 	if e != nil || r.Items == nil || r.NextPageToken != "\xff\xfe" {
 		t.Fatalf("list %#v %v", r, e)
 	}
-	s, e := p.Submit(context.Background(), launches("one"))
+	s, _, e := p.Submit(context.Background(), launches("one"), api.SubmitOptions{})
 	if e != nil || s[0].Status != api.Accepted {
 		t.Fatalf("submit %#v %v", s, e)
 	}
 	h := p.Health()
-	if h.State != "ready" || h.Protocol != 2 || h.Generation != 1 || h.Implementation != "fixture" {
+	if h.State != "ready" || h.Protocol != 3 || h.Generation != 1 || h.Implementation != "fixture" {
 		t.Fatal(h)
 	}
 	dir := p.current.dir
@@ -162,7 +162,7 @@ func TestProcessReadyInitializationAndClose(t *testing.T) {
 func TestMixedOutcomesAndConcurrentObservations(t *testing.T) {
 	o := options(t, "mixed")
 	p := start(t, o)
-	r, d, e := p.SubmitDetailed(context.Background(), launches("a", "b", "c", "d"))
+	r, d, _, e := p.SubmitDetailed(context.Background(), launches("a", "b", "c", "d"), api.SubmitOptions{})
 	if e == nil || r[0].Status != api.Accepted || r[1].Status != api.NoCapacity || r[2].Status != api.Unknown || r[3].Status != api.Unknown || len(d.Outcomes) != 5 || d.MethodError.Text != "private-method-error" {
 		t.Fatalf("%#v %#v %v", r, d, e)
 	}
@@ -178,7 +178,7 @@ func TestMixedOutcomesAndConcurrentObservations(t *testing.T) {
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
-			r, d, e := p2.SubmitDetailed(context.Background(), launches(id))
+			r, d, _, e := p2.SubmitDetailed(context.Background(), launches(id), api.SubmitOptions{})
 			if e == nil || r[0].Status != api.Unknown || d.Outcomes[0].Reason != id+"-original" || d.MethodError.Text != id+"-error" {
 				t.Errorf("correlation %s %#v %#v %v", id, r, d, e)
 			}
@@ -215,21 +215,21 @@ func TestPredispatchBoundsAndSaturation(t *testing.T) {
 	}
 	bad := launches("invalid")
 	bad[0].CPUMillis = -1
-	r, e := p.Submit(context.Background(), bad)
+	r, _, e := p.Submit(context.Background(), bad, api.SubmitOptions{})
 	if e == nil || r[0].Status != api.Rejected {
 		t.Fatal(r, e)
 	}
 	large := launches("large")
 	large[0].Lease = api.Lease(strings.Repeat("x", 4096))
-	r, e = p.Submit(context.Background(), large)
+	r, _, e = p.Submit(context.Background(), large, api.SubmitOptions{})
 	if !errors.Is(e, ErrTooLarge) || r[0].Status == api.Unknown {
 		t.Fatal(r, e)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); _, _ = p.Submit(ctx, launches("active")) }()
+	go func() { defer close(done); _, _, _ = p.Submit(ctx, launches("active"), api.SubmitOptions{}) }()
 	waitEvent(t, o.Init.BaseDir, "submit active")
-	r, e = p.Submit(context.Background(), launches("saturated"))
+	r, _, e = p.Submit(context.Background(), launches("saturated"), api.SubmitOptions{})
 	if !errors.Is(e, ErrSaturated) || r[0].Status == api.Unknown {
 		t.Fatal(r, e)
 	}
@@ -251,7 +251,7 @@ func TestFaultsNoReplayAndReplacement(t *testing.T) {
 			done := make(chan struct{})
 			var r []api.Submission
 			var e error
-			go func() { defer close(done); r, e = p.Submit(ctx, launches("fault")) }()
+			go func() { defer close(done); r, _, e = p.Submit(ctx, launches("fault"), api.SubmitOptions{}) }()
 			waitEvent(t, o.Init.BaseDir, "submit fault")
 			if mode == "cancel" {
 				cancel()
@@ -271,14 +271,14 @@ func TestFaultsNoReplayAndReplacement(t *testing.T) {
 			}
 			eventually(t, func() bool { return p.Health().State == "restarting" })
 			before := time.Now()
-			local, le := p.Submit(context.Background(), launches("during-restart"))
+			local, _, le := p.Submit(context.Background(), launches("during-restart"), api.SubmitOptions{})
 			if le == nil || local[0].Status == api.Unknown || time.Since(before) > 100*time.Millisecond {
 				t.Fatal(local, le)
 			}
 			eventually(t, func() bool { return p.Health().State == "ready" && p.Health().Generation == 2 })
 			// New invocation is allowed; the fixture's fault mode still applies.
 			c, cc := context.WithTimeout(context.Background(), 100*time.Millisecond)
-			_, _ = p.Submit(c, launches("fresh"))
+			_, _, _ = p.Submit(c, launches("fresh"), api.SubmitOptions{})
 			cc()
 			if count(o.Init.BaseDir, "submit fault") != 1 || count(o.Init.BaseDir, "submit fresh") != 1 || count(o.Init.BaseDir, "submit during-restart") != 0 {
 				t.Fatal(events(o.Init.BaseDir))
@@ -355,7 +355,7 @@ func TestCallDeadlinesAndBoundedClose(t *testing.T) {
 	if !errors.Is(e, context.DeadlineExceeded) {
 		t.Fatal(e)
 	}
-	r, e := p.Submit(context.Background(), launches("deadline"))
+	r, _, e := p.Submit(context.Background(), launches("deadline"), api.SubmitOptions{})
 	if !errors.Is(e, context.DeadlineExceeded) || r[0].Status != api.Unknown {
 		t.Fatal(r, e)
 	}
@@ -429,7 +429,7 @@ func TestDisabledRestartNeverLaunchesReplacement(t *testing.T) {
 	p.mu.Unlock()
 	_ = g.runner.Kill(context.Background())
 	eventually(t, func() bool { return p.Health().State == "exhausted" })
-	r, e := p.Submit(context.Background(), launches("disabled"))
+	r, _, e := p.Submit(context.Background(), launches("disabled"), api.SubmitOptions{})
 	if e == nil || r[0].Status == api.Unknown {
 		t.Fatal(r, e)
 	}

@@ -43,7 +43,7 @@ func TestReverseHostIgnoresFailedReadData(t *testing.T) {
 	if e != nil || !empty {
 		t.Fatal(empty, e)
 	}
-	ss, e := handle.Submit(context.Background(), launches("uncertain"))
+	ss, _, e := handle.Submit(context.Background(), launches("uncertain"), api.SubmitOptions{})
 	if e == nil || ss[0].Status != api.Unknown {
 		t.Fatal(ss, e)
 	}

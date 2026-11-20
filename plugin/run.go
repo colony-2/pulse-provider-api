@@ -84,7 +84,7 @@ func runSession(ctx context.Context, factory Factory, o RunOptions, healthyFor *
 	s := &server{opts: o.Serve, factory: factory, max: o.Serve.MaxMessageBytes, shutdown: o.Serve.ShutdownTimeout, permits: make(chan struct{}, o.Serve.Concurrency), tokens: map[uint64]struct{}{}, reverseInit: &o.Init, terminal: make(chan error, 1), ready: make(chan struct{}), factoryDone: make(chan struct{}), shutdownReceived: make(chan struct{})}
 	s.lifetime, s.cancel = context.WithCancel(ctx)
 	adopted := newSessionSocket(tc)
-	gs := grpc.NewServer(grpc.MaxRecvMsgSize(o.Serve.MaxMessageBytes), grpc.MaxSendMsgSize(o.Serve.MaxMessageBytes), grpc.MaxHeaderListSize(16<<10), grpc.MaxConcurrentStreams(uint32(o.Serve.Concurrency+2)), grpc.UnaryInterceptor(s.intercept))
+	gs := grpc.NewServer(grpc.MaxRecvMsgSize(o.Serve.MaxMessageBytes), grpc.MaxSendMsgSize(o.Serve.MaxMessageBytes), grpc.MaxHeaderListSize(16<<10), grpc.MaxConcurrentStreams(uint32(o.Serve.Concurrency+o.Serve.LogOptions.MaxSubscriptions+2)), grpc.UnaryInterceptor(s.intercept))
 	wire.RegisterProviderServer(gs, s)
 	served := make(chan struct{})
 	go func() { _ = gs.Serve(newSocketListener(adopted)); close(served) }()
@@ -123,6 +123,17 @@ func runSession(ctx context.Context, factory Factory, o RunOptions, healthyFor *
 		}
 		break
 	}
+	// The host can close its socket immediately after the shutdown response.
+	// If both notifications are ready, retain the acknowledged orderly shutdown
+	// instead of classifying the same session as an unexpected transport loss.
+	select {
+	case <-s.shutdownReceived:
+		orderly = true
+		terminal = true
+		result = nil
+	default:
+	}
+
 	if !healthySince.IsZero() {
 		*healthyFor = time.Since(healthySince)
 	}

@@ -27,13 +27,16 @@ type Provider interface {
 	// On error, discard the result; failed discovery is not an empty catalog.
 	GetCapabilities(context.Context) (Capabilities, error)
 
+	// Submit optionally observes logs independently of admission and execution.
+	// A nil Listener returns a nil subscription. A requested listener reports
+	// logging failures through its handle, separately from the admission error.
 	// Submit accepts 1..MaxBatch launches with distinct LaunchIDs. Return one
 	// Submission per launch, correlated by LaunchID rather than slice position.
 	// Batches are not atomic. Valid explicit results remain authoritative even
 	// with a non-nil error; missing, duplicate, or invalid results are uncertain.
 	// An error or canceled context alone never proves that execution cannot start.
 	// Callers must not retry uncertain submissions or immediately fall back.
-	Submit(context.Context, []Launch) ([]Submission, error)
+	Submit(context.Context, []Launch, SubmitOptions) ([]Submission, LogSubscription, error)
 
 	// List returns active instances within this provider's configured scope.
 	// It must not launch, cancel, restart, or reconcile work. A failed lookup

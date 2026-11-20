@@ -70,7 +70,7 @@ the ambient plugin environment. A factory explicitly applies or rejects them.
 Selected environment is not a sandbox for untrusted provider code.
 
 The transport is HashiCorp go-plugin v1.6.2 with mutual TLS, a private Unix socket,
-and baseline 2 only. A cookie alone is not authentication. Negotiation checks all
+and baseline 3 only. A cookie alone is not authentication. Negotiation checks all
 required semantics before construction; future execution semantics need explicit
 negotiation support. Optional trusted SHA-256 verification precedes execution.
 Framework logging is disabled; public health contains only identity, state,
@@ -234,8 +234,8 @@ err := plugin.Run(providerContext, factory, plugin.RunOptions{
 ```
 
 `Run` opens no listening port. It serves gRPC on its outbound TLS socket; the
-collector adopts that accepted socket as its gRPC client exactly once. The
-existing baseline-2 messages and generated bindings are unchanged. HashiCorp
+collector adopts that accepted socket as its gRPC client exactly once. Both transports use the
+same baseline-3 messages, including independent observation streams. HashiCorp
 [go-plugin v1.6.2](https://github.com/hashicorp/go-plugin/tree/v1.6.2) explicitly
 excludes real-network plugins; this additive transport uses gRPC's socket
 adapters and the SDK's shared call safety instead of adding a tunnel library.
@@ -244,15 +244,15 @@ The protocol layers, on exactly one connection, are:
 
 1. The provider is the TCP and TLS client; the collector accepts that connection.
 2. Mutual TLS 1.3 verifies both peers. ALPN must be
-   `pulse-provider-reverse/1`, not ordinary `h2` or `http/1.1`.
-3. Inside TLS, the collector writes `PPR1`, one status byte, a two-byte big-endian
+   `pulse-provider-reverse/3`, not ordinary `h2` or `http/1.1`.
+3. Inside TLS, the collector writes `PPR3`, one status byte, a two-byte big-endian
    identity length, and the authorized UTF-8 identity (at most 256 bytes).
    Status 0 admits; 1 denies authorization or stopped collection; 2 means duplicate
    reserved identity; 3 means provider capacity; 4 means generation exhaustion.
    Rejections have zero identity length. These are fixed admission codes, not
    provider method errors; incompatible SDK semantics fail subsequent `Negotiate`.
 4. The collector adopts that socket as the HTTP/2/gRPC client and sends the client
-   preface; the provider serves the existing unary protobuf service on its dialed
+   preface; the provider serves the protobuf service on its dialed
    socket. `Negotiate` and successful `Initialize` precede ready publication.
 
 HTTP/2 is required after admission; there is no HTTP/1 fallback, ordinary HTTPS
@@ -283,7 +283,7 @@ Collector defaults retain the local SDK's startup, business call, shutdown,
 message, concurrency, and probe bounds. Additional finite defaults are 128
 providers, 32 pending connections/authorization callbacks, 1024 change waiters,
 and 16 KiB incoming HTTP/2 metadata (provider side also 16 KiB). The provider
-serves at most business concurrency plus two control streams. Excess admissions
+reserves business concurrency, log subscription capacity, and two control streams. Excess admissions
 do not displace ready providers. TLS and authorization share the startup bound;
 a callback ignoring cancellation keeps its work slot until it returns.
 
@@ -330,8 +330,9 @@ requested launches and normalize to `unknown` in request order. Extra outcomes
 remain diagnostic observations. Accepted requires an empty reason; other statuses
 require a reason. No error text determines admission.
 
-`SubmitDetailed` returns results, invocation-correlated `SubmissionObservations`
-and error from one handler invocation. `Submit` uses the same operation and
+`SubmitDetailed(ctx, launches, options)` returns results, invocation-correlated
+`SubmissionObservations`, a log subscription, and the admission error from one
+handler invocation. `Submit` uses the same operation and
 discards observations. Observations include generation/invocation identifiers,
 original ordered entries (including duplicates), method error presence/class/text,
 and complete/truncated/not_captured markers. Capture is limited to 64 KiB of text
@@ -363,9 +364,9 @@ From the repository root, `make check` explicitly tests/vets both modules, runs
 hosting race checks, checks nested tidiness and reproduces generated bindings.
 `make generate` requires protoc 36.2 and uses pinned protoc-gen-go v1.35.2 and
 protoc-gen-go-grpc v1.5.1 in a temporary directory. It fails if generated content
-changes. Consumer tests compile the published root API with Go 1.22.12 and build/run
-copied local and reverse author/host commands in an isolated module with a temporary
-candidate replacement. The reverse pair exercises invocation snapshots and callbacks
+changes. Consumer tests compile both candidate modules with Go 1.22.12 and build/run
+copied local and reverse author/host commands in an isolated module with temporary
+candidate replacements. The reverse pair exercises invocation snapshots and callbacks
 as alpha and beta join and leave. No replacement is committed to either module.
 
 Release this directory through the repository publication route with a
@@ -378,10 +379,75 @@ A successful local replacement check does not prove
 published availability. Publication and this check do not depend on Pulse adoption.
 
 The repository's build verify hook runs `make check`. After the managed recipe
-publishes its reviewed merge result, the publish hook reads `plugin/VERSION`,
-checks that its workspace and published branch identify that result, and publishes
-the corresponding `plugin/` tag. An existing tag is reusable only for identical
-module contents; changed contents require a version bump. It then runs the fresh
-independent release check. Tagging or resolution failures fail the publication
-hook and retain diagnostics; they must not be reported as a successful release.
-Implementation work itself does not merge, push, or invoke this hook.
+publishes its reviewed merge result, the publish hook checks that its workspace
+and published branch identify that result. It does not tag or release the SDK.
+Publish the root contract first, then pin this module to that published root
+revision and separately request a versioned SDK release and fresh independent
+release check. The current `plugin/go.mod` pin predates the launch-log contract;
+local candidate checks do not claim a published SDK release. Implementation work
+itself does not merge, push, tag, or invoke publication hooks.
+
+
+## Launch-log listeners
+
+This is a breaking migration of the required root `Provider.Submit` method:
+
+```go
+results, subscription, err := p.Submit(ctx, launches, api.SubmitOptions{})
+// subscription == nil: no observation stream, queue, or callback worker.
+results, observations, subscription, err := p.SubmitDetailed(ctx, launches, options)
+```
+
+A present `options.Listener` supplies a separate context, callback, and duration.
+Duration zero means forever; every positive representable `time.Duration` is
+preserved exactly in nanoseconds, without a startup cutoff or cumulative output
+quota. It starts before registration setup and native preparation. Logs may
+arrive before Submit returns. The admission context and `CallTimeout` govern
+only admission. Logging failures never trigger replay or change item outcomes.
+
+Inspect `subscription.Coverage()` during listening. `Stop`, context cancellation,
+a wrapped `api.ErrStopListening`, or elapsed duration closes `Done` independently
+of native work. `Wait(ctx)` returns a stable `ListenerResult` and its cause;
+context expiry on a wait leaves listening active. Snapshots own their slices.
+Normal source closure drains preceding records. Other terminal causes discard
+queued records; a committed in-flight callback receives cancellation and may
+return later. Callbacks can safely call Stop. Panic text stays private.
+
+`LogOptions` on StartOptions, ServeOptions, and CollectorOptions bounds resources
+separately from membership callbacks. Run uses its ServeOptions. Defaults are
+32 subscriptions, 64 queued records per subscription, a five-second callback
+deadline, and a five-second setup deadline. Positive resource overrides are
+accepted up to 1024 subscriptions and 4096 queued records; negative values are
+invalid. These delivery bounds never replace listener duration zero. Stuck
+callbacks retain occupied capacity until return, including across collector
+reconnections, with no replacement-worker loop. Capacity and overflow failures
+are explicit subscription results while otherwise valid admission proceeds.
+
+Both transports use one authenticated bidirectional Observe stream per listener
+alongside the single unary Submit. Register binds an invocation, exact launch set,
+identity, and duration before native dispatch. Missing, stopped, expired, or
+failed registration produces canceled native logging while preserving admission.
+Generation fences reject duplicates and retired invocations. Active forever
+listeners survive invocation-window advancement. Reconnection does not resume
+old logs or resubmit work. Shutdown and session loss end existing handles.
+
+Baseline 3 changes protobuf namespace, process handshake, outbound ALPN/admission
+magic, and negotiation together. Both peers must rebuild; baseline 2 fails before
+factory initialization or native work. Records are bounded to 4096 bytes and
+fragment within negotiated envelopes. Coverage revisions publish atomically.
+Invalid frames, sequences, fragments, or source metadata terminate logging with
+stable `errors.Is` categories. No peer exception text is serialized. Output and
+private observations remain outside public health.
+
+Run `make check` at the repository root to validate both unpublished modules in
+an isolated candidate tree. It temporarily replaces the SDK's root dependency
+there, runs tests/vet/races/tidiness and pinned wire generation, and checks Go
+1.22.12 independent consumers against both candidates. No replacement is
+committed. These checks do not claim that a published SDK resolves this API.
+
+Release the root contract first. Once its commit is published, pin plugin/go.mod
+to that root revision, choose the next SDK version, and run the release checks
+before publishing the SDK. The build publication hook verifies Git publication;
+it does not tag this intermediate SDK against the older root dependency. Actual
+module release is separate from this API implementation. Real-provider capture
+and downstream adoption are also separate work.

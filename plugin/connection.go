@@ -29,6 +29,13 @@ func (p *Connection) retire(reason ProviderChangeReason) {
 	c := p.collector
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if reason == ProviderReasonAdministrativeClose {
+		p.mu.Lock()
+		if p.current != nil {
+			p.logClosing.Store(true)
+		}
+		p.mu.Unlock()
+	}
 	p.invalidate()
 	if c.reserved[p.id] == p {
 		delete(c.reserved, p.id)

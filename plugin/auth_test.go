@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	api "github.com/colony-2/pulse-provider-api"
 	"github.com/colony-2/pulse-provider-api/plugin/internal/wire"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -68,7 +69,7 @@ func TestFrameworkHealthAndProcessMetadataExcludePayloads(t *testing.T) {
 	o := options(t, "mixed")
 	o.Init.ConfigYAML = []byte("mode: fixture\n")
 	p := start(t, o)
-	_, _, _ = p.SubmitDetailed(context.Background(), launches("private-launch"))
+	_, _, _, _ = p.SubmitDetailed(context.Background(), launches("private-launch"), api.SubmitOptions{})
 	h := fmt.Sprintf("%+v", p.Health())
 	for _, secret := range []string{"exact-lease", "private-method-error", "private-launch", "mode: fixture", "executor-default"} {
 		if strings.Contains(h, secret) {

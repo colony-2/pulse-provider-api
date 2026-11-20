@@ -2,8 +2,8 @@
 
 A small, standard-library-only Go contract for implementing Pulse c2j execution
 providers in independent repositories. Pulse and external providers consume this
-module. The required `GetCapabilities` method is a new breaking interface change;
-providers must adopt it before Pulse updates its dependency.
+module. The required `Submit` operation includes optional launch-log listeners. All
+implementations and callers must migrate its arguments and return values.
 
 ```go
 import (
@@ -14,13 +14,74 @@ import (
 // The entire required interface:
 type Provider interface {
     GetCapabilities(context.Context) (provider.Capabilities, error)
-    Submit(context.Context, []provider.Launch) ([]provider.Submission, error)
+    Submit(context.Context, []provider.Launch, provider.SubmitOptions) ([]provider.Submission, provider.LogSubscription, error)
     List(context.Context, provider.ListRequest) (provider.ListResponse, error)
 }
 ```
 
-The module has one package (`provider`), one source file, and no external module
-dependencies. Its only imports are `context` and `time`. Go 1.22 is the minimum. JSON/YAML struct tags are passive metadata and require no codec dependency.
+The module has one package (`provider`) and no external module dependencies.
+It imports only standard-library packages. Go 1.22 is the minimum. JSON/YAML struct tags are passive metadata and require no codec dependency.
+
+## Observe launch logs
+
+`Submit` still reports admission, independently of log delivery and workload
+completion. Pass `SubmitOptions{}` to submit without logging; the returned
+subscription is nil. A requested listener returns a handle even when logging
+fails. Inspect that handle separately from the admission error, including when
+Submit returns an error. Never retry an uncertain admission to recover logs.
+
+```go
+results, logs, admissionErr := p.Submit(admissionCtx, launches, provider.SubmitOptions{
+    Listener: &provider.ListenOptions{
+        Context: logsCtx, // independent of the admission context
+        Duration: 0,     // forever; a positive duration starts at registration
+        OnLog: func(ctx context.Context, record provider.LaunchLog) error {
+            return display(ctx, record.Source.Prefix(), record.Data)
+        },
+    },
+})
+// Handle results and admissionErr using the ordinary admission rules.
+if logs != nil {
+    defer logs.Stop()
+    // Coverage is live, copied, and bounded per launch/source.
+    coverage := logs.Coverage()
+    _ = coverage
+    // Later: logs.Stop(), cancel logsCtx, or return ErrStopListening from OnLog.
+    // logs.Wait(waitCtx) reports a stable typed reason and error category.
+}
+```
+
+A listener requires a nonnil context and callback and a nonnegative duration.
+Zero duration has no lifetime cutoff; positive durations include provisioning
+and execution together. Stop, cancellation, or duration expiry detaches logging
+without canceling admission or accepted work. `Done` closes promptly, even if a
+callback ignores cancellation. `Wait` context expiry affects only that wait.
+Callbacks are serial and receive a canceled context when delivery ends.
+
+`LogSource.Prefix()` returns `[launch]`, `[out]`, `[err]`, or `[out+err]` for
+provider preparation/startup, execution stdout, execution stderr, and disclosed
+combined output. Records preserve binary bytes and timestamps, identify the
+launch and subscription, and carry consecutive per-launch sequences across
+sources. Each record contains at most 4096 bytes. Split native reads before
+sequencing; do not accumulate unbounded lines or prefix the stored bytes.
+
+Coverage distinguishes pending, active, closed, unavailable, and interrupted
+sources. `LastSequence` counts callback dispatch, not successful processing.
+`Closed` preserves known native closure even if delivery later fails. Partial
+coverage remains explicit, including combined-only capture and launches that
+never start. Source closure does not prove workload exit or success.
+
+Providers implement the same independent lifecycle for direct calls. They must
+return a nonnil handle when listening was requested, keep draining or safely
+detach output readers after stop, and disclose unavailable sources. Logging
+errors belong to the subscription; preserve admission outcomes and method errors.
+Do not automatically log leases, configuration, stdin, or environment values.
+Application output may itself contain secrets. Storage, retrieval, retention,
+consumer UI, and real Docker/Tart/provider capture are outside this contract.
+
+The [SDK listener documentation](plugin/README.md#launch-log-listeners) covers
+transport bounds and migration. Both SDK peers require baseline 3; there are no
+old-signature adapters or protocol downgrade paths.
 
 ## Allocation and assignment
 

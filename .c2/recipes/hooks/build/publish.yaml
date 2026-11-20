@@ -1,6 +1,6 @@
 schema_version: 2
 id: provider-plugin-release
-version: 0.1.0
+version: 0.2.0
 inputs:
   api_version: ${{ inputs.api_version }}
   base: ${{ inputs.base }}
@@ -42,7 +42,7 @@ input_schema:
 outputs:
   api_version: c2.build-hook/v1
   status: '${{ sequence.release.outputs.exit_code == 0 ? "passed" : "failed" }}'
-  summary: '${{ sequence.release.outputs.exit_code == 0 ? "Plugin tag published; independent no-replacement local and reverse examples resolved and ran, including collector joins and departures. See error/plugin-release.log for the published version and API pin." : "Plugin release acceptance failed; inspect error/plugin-release.log. No Pulse adoption is required." }}'
+  summary: '${{ sequence.release.outputs.exit_code == 0 ? "Git candidate verified. Root API is available from the published commit; SDK tagging waits for a matching root dependency pin and a separately requested release." : "Published candidate verification failed; inspect error/plugin-release.log." }}'
   artifact_refs:
     error/plugin-release.log: ${{ sequence.release.artifacts['error/plugin-release.log'] }}
 sequence:
@@ -54,5 +54,13 @@ sequence:
         MERGED_HASH: ${{ inputs.merged_hash }}
         TARGET_BRANCH: ${{ inputs.target_branch }}
       run: |
+        set -eu
         mkdir -p "$OUTBOX/error"
-        plugin/scripts/publish.sh "$MERGED_HASH" "$TARGET_BRANCH" > "$OUTBOX/error/plugin-release.log" 2>&1
+        {
+          test "$(git rev-parse HEAD)" = "$MERGED_HASH"
+          git check-ref-format "$TARGET_BRANCH"
+          git rev-parse HEAD
+          git show HEAD:go.mod
+          git show HEAD:plugin/go.mod
+          echo 'SDK release deferred until its root dependency is pinned to the published API.'
+        } > "$OUTBOX/error/plugin-release.log" 2>&1

@@ -1,5 +1,5 @@
 syntax = "proto3";
-package pulse.provider.plugin.v2;
+package pulse.provider.plugin.v3;
 option go_package = "github.com/colony-2/pulse-provider-api/plugin/internal/wire";
 import "google/protobuf/timestamp.proto";
 service Provider {
@@ -8,6 +8,7 @@ service Provider {
  rpc Control(ControlRequest) returns (Empty);
  rpc GetCapabilities(Empty) returns (CapabilitiesResponse);
  rpc Submit(SubmitRequest) returns (SubmitResponse);
+ rpc Observe(stream ObserveControl) returns (stream ObserveEvent);
  rpc List(ListRequest) returns (ListResponse);
 }
 message Empty {}
@@ -22,10 +23,18 @@ message JobRef { bytes jobdb = 1; bytes instance_id = 2; bytes tenant_id = 3; by
 message Allocation { int64 cpu_millis = 1; int64 memory_bytes = 2; int64 scratch_bytes = 3; bytes base = 4; repeated bytes capabilities = 5; }
 message Launch { bytes launch_id = 1; Allocation allocation = 2; JobRef job = 3; bytes lease = 4; int64 timeout_seconds = 5; google.protobuf.Timestamp start_before = 6; }
 message Submission { bytes launch_id = 1; bytes status = 2; bytes reason = 3; }
-message SubmitRequest { uint64 invocation = 1; repeated Launch launches = 2; }
+message SubmitRequest { uint64 invocation = 1; repeated Launch launches = 2; bool listen = 3; int64 duration_nanos = 4; bytes registration = 5; bool stopped = 6; }
 message SubmitResponse { repeated Submission results = 1; MethodError error = 2; }
 message BaseCapabilities { bytes name = 1; repeated bytes capabilities = 2; }
 message CapabilitiesResponse { repeated BaseCapabilities bases = 1; bool bases_complete = 2; MethodError error = 3; }
 message ListRequest { int32 page_size = 1; bytes page_token = 2; bytes launch_id = 3; }
 message Instance { bytes id = 1; bytes launch_id = 2; bytes state = 3; JobRef job = 4; repeated bytes refs = 5; google.protobuf.Timestamp created_at = 6; google.protobuf.Timestamp started_at = 7; }
 message ListResponse { repeated Instance items = 1; bytes next_page_token = 2; MethodError error = 3; }
+
+message LogRegistration { uint64 invocation = 1; repeated bytes launch_ids = 2; int64 duration_nanos = 3; bytes identity = 4; }
+message ObserveControl { oneof kind { LogRegistration register = 1; Empty stop = 2; } }
+message LogRecord { bytes launch_id = 1; bytes subscription_id = 2; uint64 sequence = 3; google.protobuf.Timestamp timestamp = 4; string source = 5; bytes data = 6; uint32 index = 7; bool final = 8; }
+message LogSourceStatus { bytes launch_id = 1; string source = 2; string state = 3; bool closed = 4; string cause = 5; }
+message LogCoverage { uint64 revision = 1; uint32 index = 2; bool final = 3; LogSourceStatus status = 4; }
+message LogTerminal { string reason = 1; string cause = 2; }
+message ObserveEvent { oneof kind { Empty ready = 1; LogRecord record = 2; LogCoverage coverage = 3; LogTerminal terminal = 4; } }
